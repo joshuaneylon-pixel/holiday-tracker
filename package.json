@@ -1,0 +1,24 @@
+{
+  "name": "holiday-tracker",
+  "version": "1.0.0",
+  "description": "Office holiday tracking system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "npx nodemon server.js",
+    "test": "jest --runInBand --forceExit"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^12.0.0",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  },
+  "jest": {
+    "testMatch": ["**/__tests__/**/*.test.js"]
+  }
+}
