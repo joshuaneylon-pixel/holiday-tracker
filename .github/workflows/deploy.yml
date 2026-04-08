@@ -17,5 +17,5 @@ jobs:
         uses: hostinger/deploy-on-vps@v1
         with:
           api-key: ${{ secrets.HOSTINGER_API_KEY }}
-          vm-id: ${{ vars.HOSTINGER_VM_ID }}
+          virtual-machine: ${{ vars.HOSTINGER_VM_ID }}
           project-name: holiday-app
