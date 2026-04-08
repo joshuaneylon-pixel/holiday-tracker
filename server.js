@@ -40,6 +40,7 @@ db.exec(`
     password_hash TEXT    NOT NULL,
     role          TEXT    NOT NULL DEFAULT 'employee',
     department    TEXT    NOT NULL DEFAULT '',
+    job_title     TEXT    NOT NULL DEFAULT '',
     avatar_color  TEXT    NOT NULL DEFAULT '#C41230',
     created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
   );
@@ -80,6 +81,9 @@ db.prepare(`
 
 // Migrate: add half_day column if it doesn't exist yet
 try { db.exec(`ALTER TABLE holidays ADD COLUMN half_day TEXT DEFAULT NULL`); } catch (_) {}
+
+// Migrate: add job_title column if it doesn't exist yet
+try { db.exec(`ALTER TABLE users ADD COLUMN job_title TEXT NOT NULL DEFAULT ''`); } catch (_) {}
 
 
 // Seed default admin on first run
@@ -169,6 +173,18 @@ function canManageUser(reqUser, targetUserId) {
   return false;
 }
 
+// Check whether req.user may edit a user's holiday allowance/quota
+// Managers cannot edit their own or any other manager's/admin's quota
+function canEditQuota(reqUser, targetUserId) {
+  if (reqUser.role === 'admin') return true;
+  if (reqUser.role === 'manager') {
+    const target = db.prepare('SELECT role FROM users WHERE id=?').get(targetUserId);
+    if (target && (target.role === 'manager' || target.role === 'admin')) return false;
+    return getManagedUserIds(reqUser.id).includes(targetUserId);
+  }
+  return false;
+}
+
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
 app.post('/api/auth/login', (req, res) => {
@@ -191,7 +207,7 @@ app.post('/api/auth/login', (req, res) => {
 
 app.get('/api/auth/me', auth, (req, res) => {
   const user = db.prepare(
-    'SELECT id, name, email, role, department, avatar_color, created_at FROM users WHERE id = ?'
+    'SELECT id, name, email, role, department, job_title, avatar_color, created_at FROM users WHERE id = ?'
   ).get(req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -217,7 +233,7 @@ app.get('/api/auth/me', auth, (req, res) => {
 
 app.get('/api/users', auth, adminOrManager, (req, res) => {
   let users = db.prepare(`
-    SELECT u.id, u.name, u.email, u.role, u.department, u.avatar_color, u.created_at,
+    SELECT u.id, u.name, u.email, u.role, u.department, u.job_title, u.avatar_color, u.created_at,
            COALESCE(q.total_days, 0) AS total_days
     FROM users u
     LEFT JOIN quotas q ON q.user_id = u.id
@@ -234,7 +250,7 @@ app.get('/api/users', auth, adminOrManager, (req, res) => {
 });
 
 app.post('/api/users', auth, adminOrManager, (req, res) => {
-  const { name, email, password, role = 'employee', department = '', total_days = 25, teams = [] } = req.body || {};
+  const { name, email, password, role = 'employee', department = '', job_title = '', total_days = 25, teams = [] } = req.body || {};
   if (!name || !email || !password)
     return res.status(400).json({ error: 'Name, email and password are required' });
 
@@ -244,13 +260,13 @@ app.post('/api/users', auth, adminOrManager, (req, res) => {
   try {
     const hash = bcrypt.hashSync(password, 10);
     const { lastInsertRowid } = db.prepare(
-      'INSERT INTO users (name,email,password_hash,role,department,avatar_color) VALUES (?,?,?,?,?,?)'
-    ).run(name, email.toLowerCase().trim(), hash, role, department, color);
+      'INSERT INTO users (name,email,password_hash,role,department,job_title,avatar_color) VALUES (?,?,?,?,?,?,?)'
+    ).run(name, email.toLowerCase().trim(), hash, role, department, job_title, color);
 
     db.prepare('INSERT INTO quotas (user_id,total_days) VALUES (?,?)').run(lastInsertRowid, total_days);
     setUserTeams(lastInsertRowid, teams);
 
-    const user = db.prepare('SELECT id,name,email,role,department,avatar_color FROM users WHERE id=?').get(lastInsertRowid);
+    const user = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color FROM users WHERE id=?').get(lastInsertRowid);
     res.status(201).json({ ...user, teams: getUserTeams(lastInsertRowid), total_days, used_days: 0 });
   } catch (e) {
     if (e.message?.includes('UNIQUE')) return res.status(409).json({ error: 'Email already in use' });
@@ -260,22 +276,27 @@ app.post('/api/users', auth, adminOrManager, (req, res) => {
 
 app.patch('/api/users/:id', auth, adminOrManager, (req, res) => {
   const id = parseInt(req.params.id);
-  const { name, email, role, department, password, avatar_color, total_days, teams } = req.body || {};
+  const { name, email, role, department, job_title, password, avatar_color, total_days, teams } = req.body || {};
 
   // Managers can only edit their own team members
   if (req.user.role === 'manager' && id !== req.user.id && !canManageUser(req.user, id))
     return res.status(403).json({ error: 'Forbidden' });
 
-  const user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+  const user = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color FROM users WHERE id=?').get(id);
   if (!user) return res.status(404).json({ error: 'User not found' });
+
+  // Only admins can edit a manager's or admin's quota
+  if (total_days !== undefined && !canEditQuota(req.user, id))
+    return res.status(403).json({ error: 'Only admins can edit this user\'s allowance' });
 
   if (password) db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), id);
 
-  db.prepare('UPDATE users SET name=?,email=?,role=?,department=?,avatar_color=? WHERE id=?').run(
+  db.prepare('UPDATE users SET name=?,email=?,role=?,department=?,job_title=?,avatar_color=? WHERE id=?').run(
     name ?? user.name,
     email ? email.toLowerCase().trim() : user.email,
     role ?? user.role,
     department ?? user.department,
+    job_title ?? user.job_title,
     avatar_color ?? user.avatar_color,
     id
   );
@@ -288,15 +309,15 @@ app.patch('/api/users/:id', auth, adminOrManager, (req, res) => {
 
   if (Array.isArray(teams)) setUserTeams(id, teams);
 
-  const updated = db.prepare('SELECT id,name,email,role,department,avatar_color FROM users WHERE id=?').get(id);
+  const updated = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color FROM users WHERE id=?').get(id);
   const quota   = db.prepare('SELECT total_days FROM quotas WHERE user_id=?').get(id);
   res.json({ ...updated, teams: getUserTeams(id), total_days: quota?.total_days ?? 0, used_days: getUsedDays(id) });
 });
 
-app.delete('/api/users/:id', auth, adminOrManager, (req, res) => {
+app.delete('/api/users/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Only admins can remove staff' });
   const id = parseInt(req.params.id);
   if (id === req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
-  if (!canManageUser(req.user, id)) return res.status(403).json({ error: 'Forbidden' });
   db.prepare('DELETE FROM team_members WHERE user_id=?').run(id);
   db.prepare('DELETE FROM holidays WHERE user_id=?').run(id);
   db.prepare('DELETE FROM quotas WHERE user_id=?').run(id);
@@ -312,7 +333,7 @@ app.get('/api/users/:id/profile', auth, adminOrManager, (req, res) => {
   if (!canManageUser(req.user, targetId))
     return res.status(403).json({ error: 'You can only view members of your teams' });
 
-  const user     = db.prepare('SELECT id,name,email,role,department,avatar_color,created_at FROM users WHERE id=?').get(targetId);
+  const user     = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color,created_at FROM users WHERE id=?').get(targetId);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
   const holidays = db.prepare(`
@@ -493,7 +514,7 @@ app.delete('/api/holidays/:id', auth, (req, res) => {
 app.put('/api/quotas/:userId', auth, adminOrManager, (req, res) => {
   const { total_days } = req.body || {};
   const userId = parseInt(req.params.userId);
-  if (!canManageUser(req.user, userId)) return res.status(403).json({ error: 'Forbidden' });
+  if (!canEditQuota(req.user, userId)) return res.status(403).json({ error: 'Forbidden' });
   db.prepare(
     'INSERT INTO quotas (user_id,total_days) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET total_days=excluded.total_days'
   ).run(userId, total_days);

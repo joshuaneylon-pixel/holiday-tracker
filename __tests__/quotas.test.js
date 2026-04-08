@@ -38,6 +38,57 @@ describe('PUT /api/quotas/:userId', () => {
       .send({ total_days: 100 });
     expect(res.status).toBe(403);
   });
+
+  test('manager cannot update their own quota', async () => {
+    const res = await request(env.app)
+      .put(`/api/quotas/${env.mgr.id}`)
+      .set('Authorization', `Bearer ${env.mgrToken}`)
+      .send({ total_days: 30 });
+    expect(res.status).toBe(403);
+  });
+
+  test('manager cannot update another manager\'s quota', async () => {
+    // Create a second manager via admin
+    const created = await request(env.app)
+      .post('/api/users')
+      .set('Authorization', `Bearer ${env.adminToken}`)
+      .send({ name: 'Manager Two', email: 'mgr2@test.com', password: 'Manager2!', role: 'manager', teams: ['Design Team'] });
+    expect(created.status).toBe(201);
+
+    const res = await request(env.app)
+      .put(`/api/quotas/${created.body.id}`)
+      .set('Authorization', `Bearer ${env.mgrToken}`)
+      .send({ total_days: 30 });
+    expect(res.status).toBe(403);
+  });
+
+  test('admin can update a manager\'s quota', async () => {
+    const res = await request(env.app)
+      .put(`/api/quotas/${env.mgr.id}`)
+      .set('Authorization', `Bearer ${env.adminToken}`)
+      .send({ total_days: 28 });
+    expect(res.status).toBe(200);
+    expect(res.body.total_days).toBe(28);
+  });
+});
+
+describe('PATCH /api/users/:id quota restriction', () => {
+  test('manager cannot update their own allowance via PATCH', async () => {
+    const res = await request(env.app)
+      .patch(`/api/users/${env.mgr.id}`)
+      .set('Authorization', `Bearer ${env.mgrToken}`)
+      .send({ total_days: 30 });
+    expect(res.status).toBe(403);
+  });
+
+  test('admin can update a manager\'s allowance via PATCH', async () => {
+    const res = await request(env.app)
+      .patch(`/api/users/${env.mgr.id}`)
+      .set('Authorization', `Bearer ${env.adminToken}`)
+      .send({ total_days: 28 });
+    expect(res.status).toBe(200);
+    expect(res.body.total_days).toBe(28);
+  });
 });
 
 describe('Working days calculation', () => {

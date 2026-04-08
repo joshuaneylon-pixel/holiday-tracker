@@ -880,7 +880,7 @@ function drawStaffTable() {
     </div>
 
     ${S.allTeams.length > 0 ? `
-    <div class="team-filters" style="margin-bottom:0">
+    <div class="team-filters">
       <button class="team-pill ${!S.staffTeamFilter ? 'active' : ''}" onclick="setStaffTeamFilter(null)">All Teams</button>
       ${S.allTeams.map(t => `
         <button class="team-pill ${S.staffTeamFilter === t ? 'active' : ''}" onclick="setStaffTeamFilter('${escHtml(t).replace(/'/g,"\\'")}')">
@@ -919,6 +919,7 @@ function drawStaffTable() {
                         <div class="avatar" style="background:${u.avatar_color};width:32px;height:32px;font-size:12px">${initials(u.name)}</div>
                         <div class="user-cell-info">
                           <div class="user-cell-name">${escHtml(u.name)}</div>
+                          ${u.job_title ? `<div class="user-cell-email" style="color:var(--text-2)">${escHtml(u.job_title)}</div>` : ''}
                           <div class="user-cell-email">${escHtml(u.email)}</div>
                         </div>
                       </div>
@@ -947,7 +948,7 @@ function drawStaffTable() {
                       <div class="td-actions">
                         <button class="btn btn-ghost btn-sm" onclick="goToUserProfile(${u.id})" title="View holidays">${iPerson()} View</button>
                         <button class="btn btn-ghost btn-sm" onclick="openUserModal(${u.id})">Edit</button>
-                        ${u.id !== S.user.id
+                        ${S.user.role === 'admin' && u.id !== S.user.id
                           ? `<button class="btn btn-danger btn-sm" onclick="deleteUser(${u.id}, '${escHtml(u.name)}')">Remove</button>`
                           : ''}
                       </div>
@@ -1224,6 +1225,8 @@ function openUserModal(userId) {
   // Seed the modal team selection from the user's current teams
   _modalTeams = user?.teams ? [...user.teams] : [];
 
+  const quotaReadOnly = S.user.role === 'manager' && (user?.role === 'manager' || user?.role === 'admin');
+
   showModal(`
     <div class="modal-header">
       <span class="modal-title">${isEdit ? 'Edit Employee' : 'Add Employee'}</span>
@@ -1256,8 +1259,12 @@ function openUserModal(userId) {
           </div>
         </div>
         <div class="field">
-          <label class="field-label">Annual Leave Allowance (days)</label>
-          <input type="number" class="input" id="u-quota" value="${user?.total_days ?? 25}" min="0" max="365" />
+          <label class="field-label">Job Title</label>
+          <input type="text" class="input" id="u-job-title" value="${escHtml(user?.job_title || '')}" placeholder="e.g. Senior Designer" />
+        </div>
+        <div class="field">
+          <label class="field-label">Annual Leave Allowance (days)${quotaReadOnly ? ' <span style="color:var(--text-3);font-weight:400">(admin only)</span>' : ''}</label>
+          <input type="number" class="input" id="u-quota" value="${user?.total_days ?? 25}" min="0" max="365" ${quotaReadOnly ? 'disabled' : ''} />
         </div>
         <div class="field">
           <label class="field-label">Teams <span style="color:var(--text-3);font-weight:400">(select all that apply)</span></label>
@@ -1316,13 +1323,15 @@ function addModalTeam() {
 }
 
 async function submitUser(userId) {
-  const name       = document.getElementById('u-name')?.value.trim();
-  const email      = document.getElementById('u-email')?.value.trim();
-  const password   = document.getElementById('u-password')?.value;
-  const role       = document.getElementById('u-role')?.value;
-  const total_days = parseInt(document.getElementById('u-quota')?.value) || 0;
-  const errEl      = document.getElementById('u-err');
-  const btn        = document.getElementById('u-submit');
+  const name        = document.getElementById('u-name')?.value.trim();
+  const email       = document.getElementById('u-email')?.value.trim();
+  const password    = document.getElementById('u-password')?.value;
+  const role        = document.getElementById('u-role')?.value;
+  const job_title   = document.getElementById('u-job-title')?.value.trim() || '';
+  const quotaEl     = document.getElementById('u-quota');
+  const total_days  = quotaEl?.disabled ? undefined : (parseInt(quotaEl?.value) || 0);
+  const errEl       = document.getElementById('u-err');
+  const btn         = document.getElementById('u-submit');
 
   if (!name || !email) {
     errEl.textContent = 'Name and email are required.';
@@ -1337,7 +1346,8 @@ async function submitUser(userId) {
   btn.innerHTML = `<span class="spinner"></span> Saving…`;
 
   try {
-    const body = { name, email, role, total_days, teams: _modalTeams };
+    const body = { name, email, role, job_title, teams: _modalTeams };
+    if (total_days !== undefined) body.total_days = total_days;
     if (password) body.password = password;
 
     if (userId) {
@@ -1411,7 +1421,7 @@ async function viewUserProfile() {
           <h2 class="profile-name">${escHtml(user.name)}</h2>
           <div class="profile-meta">
             <span class="badge" style="background:${roleBg(user.role)};color:${roleColor(user.role)};border-color:${roleBorder(user.role)}">${cap(user.role)}</span>
-            ${escHtml(user.email)}
+            ${user.job_title ? `<span style="color:var(--text-2)">${escHtml(user.job_title)}</span> &middot; ` : ''}${escHtml(user.email)}
           </div>
           ${(user.teams || []).length > 0 ? `
           <div class="profile-teams">
