@@ -21,6 +21,8 @@ const S = {
   teamMonth: new Date().getMonth() + 1,
   // Requests tab
   reqTab: 'pending',
+  reqTeamFilter: null,
+  staffTeamFilter: null,
   // Team filter
   teamFilter: null,
   // Data cache
@@ -273,9 +275,18 @@ async function viewDashboard() {
   const remaining = Math.max(0, total - used);
   const pct       = total > 0 ? Math.min(100, Math.round(used / total * 100)) : 0;
 
-  S.myHolidays = await api('GET', `/holidays?userId=${u.id}`);
+  const today = todayStr();
+  const [myHols, rawTodayOff] = await Promise.all([
+    api('GET', `/holidays?userId=${u.id}`),
+    api('GET', `/holidays/team?date=${today}`)
+  ]);
+  S.myHolidays = myHols;
 
-  const today   = todayStr();
+  // Scope "who's off" to the user's own teams (employees/managers); admins see all
+  const myTeams = u.teams || [];
+  const todayOff = (myTeams.length === 0 || u.role === 'admin')
+    ? rawTodayOff
+    : rawTodayOff.filter(h => (h.user_teams || []).some(t => myTeams.includes(t)));
   const upcoming = S.myHolidays
     .filter(h => h.status === 'approved' && h.end_date >= today)
     .sort((a, b) => a.start_date.localeCompare(b.start_date))
@@ -394,6 +405,8 @@ async function viewDashboard() {
             </div>
           </div>
         </div>
+
+        ${buildWhoIsOffWidget(todayOff, myTeams, u.role)}
       </div>
     </div>
   `;
@@ -671,19 +684,71 @@ function teamCalToday() {
 
 // ─── View: Requests ───────────────────────────────────────────────────────────
 
+function buildWhoIsOffWidget(people, myTeams, role) {
+  const MAX = 4;
+  const shown = people.slice(0, MAX);
+  const extra = people.length - MAX;
+
+  // Label shown under the title
+  const scopeLabel = role === 'admin'
+    ? 'Company-wide'
+    : myTeams.length === 1 ? escHtml(myTeams[0])
+    : myTeams.length > 1  ? 'Your teams'
+    : '';
+
+  const countBadge = people.length > 0
+    ? `<span class="wio-count">${people.length} off</span>`
+    : '';
+
+  const body = people.length === 0
+    ? `<div class="wio-empty">
+        <span class="wio-empty-icon">🎉</span>
+        <p class="wio-empty-text">Everyone's in today</p>
+      </div>`
+    : `<div class="wio-list">
+        ${shown.map(h => `
+          <div class="wio-row">
+            <div class="avatar" style="background:${h.avatar_color};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(h.user_name || '')}</div>
+            <div class="wio-info">
+              <div class="wio-name">${escHtml(h.user_name || '')}</div>
+              <div class="wio-meta">${TYPE_LABELS[h.type] || cap(h.type)}</div>
+            </div>
+            ${h.half_day ? `<span class="hd-badge">${h.half_day}</span>` : ''}
+          </div>`).join('')}
+        ${extra > 0 ? `<div class="wio-more" onclick="navigate('team')">${extra} more → View calendar</div>` : ''}
+      </div>`;
+
+  return `
+    <div class="card wio-card">
+      <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
+        <div>
+          <div class="card-title">Who's Off Today</div>
+          ${scopeLabel ? `<div style="font-size:11px;color:var(--text-3);margin-top:1px">${scopeLabel}</div>` : ''}
+        </div>
+        ${countBadge}
+      </div>
+      ${body}
+    </div>`;
+}
+
 async function viewRequests() {
   if (!isPriv()) return navigate('dashboard');
   const main = document.getElementById('main-content');
   main.innerHTML = `<div class="loading-view"><div class="spinner dark"></div></div>`;
-  S.allHolidays = await api('GET', '/holidays');
+  const [holidays, teams] = await Promise.all([api('GET', '/holidays'), api('GET', '/teams')]);
+  S.allHolidays = holidays;
+  S.allTeams = teams;
   drawRequestsTable();
 }
 
 function drawRequestsTable() {
   const main = document.getElementById('main-content');
-  const filtered = S.reqTab === 'all' ? S.allHolidays : S.allHolidays.filter(h => h.status === S.reqTab);
+  const teamBase = S.reqTeamFilter
+    ? S.allHolidays.filter(h => (h.user_teams || []).includes(S.reqTeamFilter))
+    : S.allHolidays;
+  const filtered = S.reqTab === 'all' ? teamBase : teamBase.filter(h => h.status === S.reqTab);
   const counts = { pending: 0, approved: 0, rejected: 0 };
-  S.allHolidays.forEach(h => { if (counts[h.status] !== undefined) counts[h.status]++; });
+  teamBase.forEach(h => { if (counts[h.status] !== undefined) counts[h.status]++; });
 
   main.innerHTML = `
     <div class="view-header">
@@ -694,11 +759,19 @@ function drawRequestsTable() {
     </div>
 
     <div class="section">
+      ${S.allTeams.length > 0 ? `
+      <div class="team-filters" style="margin-bottom:16px">
+        <button class="team-pill ${!S.reqTeamFilter ? 'active' : ''}" onclick="setReqTeamFilter(null)">All Teams</button>
+        ${S.allTeams.map(t => `
+          <button class="team-pill ${S.reqTeamFilter === t ? 'active' : ''}" onclick="setReqTeamFilter('${escHtml(t).replace(/'/g,"\\'")}')">
+            ${escHtml(t)}
+          </button>`).join('')}
+      </div>` : ''}
       <div style="margin-bottom:16px">
         <div class="tabs">
           ${['pending','approved','rejected','all'].map(t => `
             <div class="tab ${S.reqTab === t ? 'active' : ''}" onclick="setReqTab('${t}')">
-              ${cap(t)}${t !== 'all' && counts[t] > 0 ? ` (${counts[t]})` : t === 'all' ? ` (${S.allHolidays.length})` : ''}
+              ${cap(t)}${t !== 'all' && counts[t] > 0 ? ` (${counts[t]})` : t === 'all' ? ` (${teamBase.length})` : ''}
             </div>`).join('')}
         </div>
       </div>
@@ -743,7 +816,7 @@ function drawRequestsTable() {
                       <td style="font-weight:600;font-feature-settings:'tnum'">${dayLabel}</td>
                       <td style="color:var(--text-2);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(h.notes) || '—'}</td>
                       <td><span class="badge badge-${h.status}"><span class="badge-dot"></span>${cap(h.status)}</span></td>
-                      <td style="color:var(--text-2);font-size:12.5px">${h.reviewed_by_name ? escHtml(h.reviewed_by_name) : '—'}</td>
+                      <td style="font-size:12.5px">${h.reviewed_by_name ? `<span style="color:var(--text-2)">${escHtml(h.reviewed_by_name)}</span><br><span style="color:var(--text-3)">${fmtDateShort(h.reviewed_at?.split(' ')[0] || '')}</span>` : '—'}</td>
                       <td>
                         <div class="td-actions">
                           ${h.status === 'pending'
@@ -763,6 +836,7 @@ function drawRequestsTable() {
 }
 
 function setReqTab(tab) { S.reqTab = tab; drawRequestsTable(); }
+function setReqTeamFilter(team) { S.reqTeamFilter = team || null; drawRequestsTable(); }
 
 async function reviewRequest(id, status) {
   try {
@@ -792,17 +866,29 @@ async function viewStaff() {
 
 function drawStaffTable() {
   const main = document.getElementById('main-content');
+  const visibleUsers = S.staffTeamFilter
+    ? S.allUsers.filter(u => (u.teams || []).includes(S.staffTeamFilter))
+    : S.allUsers;
 
   main.innerHTML = `
     <div class="view-header">
       <div>
         <h1 class="view-title">Manage Staff</h1>
-        <p class="view-subtitle">${S.allUsers.length} team member${S.allUsers.length !== 1 ? 's' : ''}</p>
+        <p class="view-subtitle">${visibleUsers.length} team member${visibleUsers.length !== 1 ? 's' : ''}</p>
       </div>
       <button class="btn btn-primary" onclick="openUserModal(null)">${iPlus()} Add Employee</button>
     </div>
 
-    ${S.allUsers.length === 0
+    ${S.allTeams.length > 0 ? `
+    <div class="team-filters" style="margin-bottom:0">
+      <button class="team-pill ${!S.staffTeamFilter ? 'active' : ''}" onclick="setStaffTeamFilter(null)">All Teams</button>
+      ${S.allTeams.map(t => `
+        <button class="team-pill ${S.staffTeamFilter === t ? 'active' : ''}" onclick="setStaffTeamFilter('${escHtml(t).replace(/'/g,"\\'")}')">
+          ${escHtml(t)}
+        </button>`).join('')}
+    </div>` : ''}
+
+    ${visibleUsers.length === 0
       ? `<div class="card"><div class="empty-state">
           <div class="empty-state-icon">👥</div>
           <p class="empty-state-title">No team members yet</p>
@@ -822,7 +908,7 @@ function drawStaffTable() {
               </tr>
             </thead>
             <tbody>
-              ${S.allUsers.map(u => {
+              ${visibleUsers.map(u => {
                 const rem = Math.max(0, (u.total_days || 0) - (u.used_days || 0));
                 const pct = u.total_days > 0 ? Math.min(100, Math.round((u.used_days || 0) / u.total_days * 100)) : 0;
                 const teams = u.teams || [];
@@ -996,6 +1082,7 @@ function openHolidayModal(onBehalfOfId = null) {
             <div class="days-info-label">After Request</div>
           </div>
         </div>
+        <div id="hol-warn" class="modal-warn hidden"></div>
         <div id="hol-err" class="modal-error hidden"></div>
       </div>
     </div>
@@ -1022,6 +1109,22 @@ function syncHolDates() {
   if (start) {
     endEl.min = start;
     if (end && end < start) endEl.value = start;
+  }
+
+  // Short-notice warning
+  const warnEl = document.getElementById('hol-warn');
+  if (warnEl) {
+    if (start) {
+      const daysUntil = Math.ceil((new Date(start + 'T00:00:00') - new Date()) / 86400000);
+      if (daysUntil < 28) {
+        warnEl.textContent = `⚠ This request starts in ${daysUntil} day${daysUntil !== 1 ? 's' : ''} — short-notice requests (under 28 days) may be rejected.`;
+        warnEl.classList.remove('hidden');
+      } else {
+        warnEl.classList.add('hidden');
+      }
+    } else {
+      warnEl.classList.add('hidden');
+    }
   }
 
   // Show half-day toggle only for single-day bookings on a weekday
@@ -1111,6 +1214,8 @@ async function cancelHoliday(id) {
 }
 
 // ─── User Modal ───────────────────────────────────────────────────────────────
+
+function setStaffTeamFilter(team) { S.staffTeamFilter = team || null; drawStaffTable(); }
 
 function openUserModal(userId) {
   const user   = userId ? S.allUsers.find(u => u.id === userId) : null;
@@ -1387,7 +1492,7 @@ async function viewUserProfile() {
                       <td style="color:var(--text-2);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(h.notes) || '—'}</td>
                       <td style="color:var(--text-2);font-size:12.5px">${fmtDateShort(h.requested_at?.split(' ')[0] || '')}</td>
                       <td><span class="badge badge-${h.status}"><span class="badge-dot"></span>${cap(h.status)}</span></td>
-                      <td style="color:var(--text-2);font-size:12.5px">${h.reviewed_by_name ? escHtml(h.reviewed_by_name) : '—'}</td>
+                      <td style="font-size:12.5px">${h.reviewed_by_name ? `<span style="color:var(--text-2)">${escHtml(h.reviewed_by_name)}</span><br><span style="color:var(--text-3)">${fmtDateShort(h.reviewed_at?.split(' ')[0] || '')}</span>` : '—'}</td>
                       <td>
                         <div class="td-actions">
                           ${h.status === 'pending' ? `

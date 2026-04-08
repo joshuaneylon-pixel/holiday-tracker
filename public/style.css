@@ -696,6 +696,18 @@ tbody tr:hover td { background: #FAFAF9; }
 
 .modal-close:hover { background: var(--surface-2); color: var(--text); }
 
+/* ─── Modal Warning ─────────────────────────────────────────────────────── */
+.modal-warn {
+  background: var(--amber-bg);
+  border: 1px solid var(--amber-border);
+  color: var(--amber);
+  border-radius: var(--r);
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
 /* ─── Modal Error ────────────────────────────────────────────────────────── */
 .modal-error {
   background: rgba(196,18,48,0.06);
@@ -756,6 +768,22 @@ tbody tr:hover td { background: #FAFAF9; }
 
 /* Calendar half-day event styling */
 .cal-event-half { opacity: 0.75; border-left: 2px solid rgba(255,255,255,0.5); }
+
+/* ─── Who's Off Today widget ─────────────────────────────────────────────── */
+.wio-card { overflow: hidden; }
+.wio-count { background: var(--red); color: white; border-radius: 20px; padding: 2px 9px; font-size: 11px; font-weight: 700; flex-shrink: 0; }
+.wio-list { display: flex; flex-direction: column; }
+.wio-row { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--border); transition: background 0.1s; }
+.wio-row:last-child { border-bottom: none; }
+.wio-row:hover { background: var(--surface-2); }
+.wio-info { flex: 1; min-width: 0; }
+.wio-name { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wio-meta { font-size: 11.5px; color: var(--text-3); margin-top: 1px; }
+.wio-empty { padding: 32px 20px; text-align: center; }
+.wio-empty-icon { font-size: 28px; display: block; margin-bottom: 8px; }
+.wio-empty-text { font-size: 13px; color: var(--text-3); margin: 0; }
+.wio-more { display: block; padding: 10px 20px; font-size: 12px; color: var(--red); font-weight: 600; cursor: pointer; border-top: 1px solid var(--border); text-align: center; transition: background 0.1s; }
+.wio-more:hover { background: var(--surface-2); }
 
 /* ─── Toast ──────────────────────────────────────────────────────────────── */
 .toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }

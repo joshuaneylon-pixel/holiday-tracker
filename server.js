@@ -161,6 +161,9 @@ function adminOrManager(req, res, next) {
 function canManageUser(reqUser, targetUserId) {
   if (reqUser.role === 'admin') return true;
   if (reqUser.role === 'manager') {
+    // Managers cannot manage admins
+    const target = db.prepare('SELECT role FROM users WHERE id=?').get(targetUserId);
+    if (target && target.role === 'admin') return false;
     return getManagedUserIds(reqUser.id).includes(targetUserId);
   }
   return false;
@@ -221,10 +224,10 @@ app.get('/api/users', auth, adminOrManager, (req, res) => {
     ORDER BY u.name
   `).all();
 
-  // For managers: only return users in their teams
+  // For managers: only return users in their teams, never admins
   if (req.user.role === 'manager') {
     const ids = getManagedUserIds(req.user.id);
-    users = users.filter(u => ids.includes(u.id) || u.id === req.user.id);
+    users = users.filter(u => (ids.includes(u.id) || u.id === req.user.id) && u.role !== 'admin');
   }
 
   res.json(users.map(u => ({ ...u, teams: getUserTeams(u.id), used_days: getUsedDays(u.id) })));
@@ -293,6 +296,7 @@ app.patch('/api/users/:id', auth, adminOrManager, (req, res) => {
 app.delete('/api/users/:id', auth, adminOrManager, (req, res) => {
   const id = parseInt(req.params.id);
   if (id === req.user.id) return res.status(400).json({ error: 'Cannot delete your own account' });
+  if (!canManageUser(req.user, id)) return res.status(403).json({ error: 'Forbidden' });
   db.prepare('DELETE FROM team_members WHERE user_id=?').run(id);
   db.prepare('DELETE FROM holidays WHERE user_id=?').run(id);
   db.prepare('DELETE FROM quotas WHERE user_id=?').run(id);
@@ -331,7 +335,8 @@ app.get('/api/holidays', auth, (req, res) => {
   const isAdmin = req.user.role === 'admin';
 
   let q = `SELECT h.*, u.name AS user_name, u.avatar_color, u.department,
-           rv.name AS reviewed_by_name
+           rv.name AS reviewed_by_name,
+           (SELECT GROUP_CONCAT(tm.team,'|||') FROM team_members tm WHERE tm.user_id=h.user_id) AS user_teams_raw
            FROM holidays h
            JOIN users u ON u.id = h.user_id
            LEFT JOIN users rv ON rv.id = h.reviewed_by
@@ -355,11 +360,15 @@ app.get('/api/holidays', auth, (req, res) => {
 
   if (status) { q += ' AND h.status=?'; p.push(status); }
   q += ' ORDER BY h.start_date DESC';
-  res.json(db.prepare(q).all(...p));
+  const rows = db.prepare(q).all(...p).map(row => ({
+    ...row,
+    user_teams: (row.user_teams_raw || '').split('|||').filter(Boolean)
+  }));
+  res.json(rows);
 });
 
 app.get('/api/holidays/team', auth, (req, res) => {
-  const { year, month, team } = req.query;
+  const { year, month, team, date } = req.query;
   let q = `SELECT h.*, u.name AS user_name, u.avatar_color, u.department,
            (SELECT GROUP_CONCAT(tm.team, '|||') FROM team_members tm WHERE tm.user_id = h.user_id) AS user_teams_raw,
            rv.name AS reviewed_by_name
@@ -389,7 +398,11 @@ app.get('/api/holidays/team', auth, (req, res) => {
     q += ' AND h.start_date<=? AND h.end_date>=?'; p.push(last, first);
   }
 
-  q += ' ORDER BY h.start_date';
+  if (date) {
+    q += ' AND h.start_date<=? AND h.end_date>=?'; p.push(date, date);
+  }
+
+  q += ' ORDER BY u.name';
   const rows = db.prepare(q).all(...p).map(row => ({
     ...row,
     user_teams: (row.user_teams_raw || '').split('|||').filter(Boolean)
@@ -446,10 +459,16 @@ app.patch('/api/holidays/:id/status', auth, adminOrManager, (req, res) => {
   db.prepare(`UPDATE holidays SET status=?, reviewed_at=datetime('now'), reviewed_by=? WHERE id=?`)
     .run(status, req.user.id, id);
 
-  const updated = db.prepare(
-    'SELECT h.*,u.name AS user_name,u.avatar_color FROM holidays h JOIN users u ON u.id=h.user_id WHERE h.id=?'
-  ).get(id);
-  res.json(updated);
+  const updated = db.prepare(`
+    SELECT h.*, u.name AS user_name, u.avatar_color, u.department,
+           rv.name AS reviewed_by_name,
+           (SELECT GROUP_CONCAT(tm.team,'|||') FROM team_members tm WHERE tm.user_id=h.user_id) AS user_teams_raw
+    FROM holidays h
+    JOIN users u ON u.id = h.user_id
+    LEFT JOIN users rv ON rv.id = h.reviewed_by
+    WHERE h.id=?
+  `).get(id);
+  res.json({ ...updated, user_teams: (updated.user_teams_raw || '').split('|||').filter(Boolean) });
 });
 
 app.delete('/api/holidays/:id', auth, (req, res) => {
@@ -485,10 +504,11 @@ app.put('/api/quotas/:userId', auth, adminOrManager, (req, res) => {
 
 app.get('/api/teams', auth, (req, res) => {
   let teams;
-  if (req.user.role === 'manager') {
-    teams = getUserTeams(req.user.id);
-  } else {
+  if (req.user.role === 'admin') {
     teams = db.prepare('SELECT DISTINCT team FROM team_members ORDER BY team').all().map(r => r.team);
+  } else {
+    // Managers and employees only see their own teams
+    teams = getUserTeams(req.user.id);
   }
   res.json(teams);
 });
