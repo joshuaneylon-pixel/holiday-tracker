@@ -61,6 +61,14 @@ describe('POST /api/users', () => {
       .send({ name: 'X', email: 'x@test.com', password: 'Pass1!', role: 'employee' });
     expect(res.status).toBe(403);
   });
+
+  test('manager cannot create users', async () => {
+    const res = await request(env.app)
+      .post('/api/users')
+      .set('Authorization', `Bearer ${env.mgrToken}`)
+      .send({ name: 'New', email: 'new2@test.com', password: 'Pass1!', role: 'employee' });
+    expect(res.status).toBe(403);
+  });
 });
 
 describe('PATCH /api/users/:id', () => {
@@ -86,6 +94,14 @@ describe('PATCH /api/users/:id', () => {
       .patch(`/api/users/${env.emp2.id}`)
       .set('Authorization', `Bearer ${env.mgrToken}`)
       .send({ name: 'Hacked' });
+    expect(res.status).toBe(403);
+  });
+
+  test('manager cannot change a team member role', async () => {
+    const res = await request(env.app)
+      .patch(`/api/users/${env.emp.id}`)
+      .set('Authorization', `Bearer ${env.mgrToken}`)
+      .send({ role: 'manager' });
     expect(res.status).toBe(403);
   });
 

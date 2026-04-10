@@ -266,7 +266,8 @@ app.get('/api/users', auth, adminOrManager, (req, res) => {
   res.json(users.map(u => ({ ...u, teams: getUserTeams(u.id), used_days: getUsedDays(u.id) })));
 });
 
-app.post('/api/users', auth, adminOrManager, (req, res) => {
+app.post('/api/users', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Only admins can add staff' });
   const { name, email, password, role = 'employee', department = '', job_title = '', total_days = 25, teams = [] } = req.body || {};
   if (!name || !email || !password)
     return res.status(400).json({ error: 'Name, email and password are required' });
@@ -305,6 +306,10 @@ app.patch('/api/users/:id', auth, adminOrManager, (req, res) => {
   // Only admins can edit a manager's or admin's quota
   if (total_days !== undefined && !canEditQuota(req.user, id))
     return res.status(403).json({ error: 'Only admins can edit this user\'s allowance' });
+
+  // Only admins can change roles
+  if (role !== undefined && req.user.role !== 'admin')
+    return res.status(403).json({ error: 'Only admins can change roles' });
 
   if (password) db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), id);
 

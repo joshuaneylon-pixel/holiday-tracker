@@ -917,9 +917,11 @@ function drawStaffView() {
       <div class="tab ${S.staffTab === 'public-holidays' ? 'active' : ''}" onclick="setStaffTab('public-holidays')">Public Holidays</div>
     </div>` : '';
 
-  const addBtn = S.staffTab === 'staff' || !isAdmin
-    ? `<button class="btn btn-primary" onclick="openUserModal(null)">${iPlus()} Add Employee</button>`
-    : `<button class="btn btn-primary" onclick="openPublicHolidayModal()">${iPlus()} Add Public Holiday</button>`;
+  const addBtn = !isAdmin
+    ? ''
+    : S.staffTab === 'staff'
+      ? `<button class="btn btn-primary" onclick="openUserModal(null)">${iPlus()} Add Employee</button>`
+      : `<button class="btn btn-primary" onclick="openPublicHolidayModal()">${iPlus()} Add Public Holiday</button>`;
 
   const visibleUsers = S.staffTeamFilter
     ? S.allUsers.filter(u => (u.teams || []).includes(S.staffTeamFilter))
@@ -1439,14 +1441,23 @@ function openUserModal(userId) {
             <label class="field-label">${isEdit ? 'New Password' : 'Password'} ${isEdit ? '<span style="color:var(--text-3);font-weight:400">(leave blank to keep)</span>' : ''}</label>
             <input type="password" class="input" id="u-password" placeholder="${isEdit ? 'Leave blank to keep' : 'Min. 8 characters'}" />
           </div>
-          <div class="field">
-            <label class="field-label">Role</label>
-            <select class="select" id="u-role">
-              <option value="employee" ${user?.role === 'employee' ? 'selected' : ''}>Employee</option>
-              <option value="manager"  ${user?.role === 'manager'  ? 'selected' : ''}>Manager</option>
-              <option value="admin"    ${user?.role === 'admin'    ? 'selected' : ''}>Admin</option>
-            </select>
-          </div>
+          ${S.user.role === 'admin'
+            ? `<div class="field">
+                <label class="field-label">Role</label>
+                <select class="select" id="u-role">
+                  <option value="employee" ${user?.role === 'employee' ? 'selected' : ''}>Employee</option>
+                  <option value="manager"  ${user?.role === 'manager'  ? 'selected' : ''}>Manager</option>
+                  <option value="admin"    ${user?.role === 'admin'    ? 'selected' : ''}>Admin</option>
+                </select>
+               </div>`
+            : `<div class="field">
+                <label class="field-label">Role</label>
+                <div style="padding:8px 0">
+                  <span class="badge" style="background:${roleBg(user?.role)};color:${roleColor(user?.role)};border-color:${roleBorder(user?.role)}">${cap(user?.role || 'employee')}</span>
+                </div>
+                <input type="hidden" id="u-role" value="${user?.role || 'employee'}" />
+               </div>`
+          }
         </div>
         <div class="field">
           <label class="field-label">Job Title</label>
