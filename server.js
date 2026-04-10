@@ -71,6 +71,14 @@ db.exec(`
     user_id    INTEGER NOT NULL UNIQUE REFERENCES users(id),
     total_days INTEGER NOT NULL DEFAULT 25
   );
+
+  CREATE TABLE IF NOT EXISTS public_holidays (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL,
+    date       TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_by INTEGER REFERENCES users(id)
+  );
 `);
 
 // Migrate any existing department strings → team_members rows
@@ -120,19 +128,28 @@ function setUserTeams(userId, teams) {
 
 // ─── Quota/Days Helpers ───────────────────────────────────────────────────────
 
+function countPublicHolidayOverlap(startDate, endDate) {
+  const rows = db.prepare(
+    `SELECT date FROM public_holidays WHERE date >= ? AND date <= ?`
+  ).all(startDate, endDate);
+  return rows.filter(r => {
+    const dow = new Date(r.date + 'T00:00:00').getDay();
+    return dow !== 0 && dow !== 6;
+  }).length;
+}
+
 function getUsedDays(userId) {
-  return db.prepare(`
-    SELECT COALESCE(SUM(
-      CASE WHEN half_day IS NOT NULL
-        THEN workdays(start_date, end_date) * 0.5
-        ELSE workdays(start_date, end_date)
-      END
-    ), 0) AS days
-    FROM holidays
-    WHERE user_id = ?
-      AND status = 'approved'
+  const rows = db.prepare(`
+    SELECT start_date, end_date, half_day FROM holidays
+    WHERE user_id = ? AND status = 'approved'
       AND CAST(strftime('%Y', start_date) AS INTEGER) = CAST(strftime('%Y','now') AS INTEGER)
-  `).get(userId).days;
+  `).all(userId);
+  return rows.reduce((sum, h) => {
+    const raw = db.prepare('SELECT workdays(?,?) AS w').get(h.start_date, h.end_date).w;
+    const phOverlap = countPublicHolidayOverlap(h.start_date, h.end_date);
+    const deductible = Math.max(0, raw - phOverlap);
+    return sum + (h.half_day ? deductible * 0.5 : deductible);
+  }, 0);
 }
 
 function enrichUser(u) {
@@ -428,7 +445,35 @@ app.get('/api/holidays/team', auth, (req, res) => {
     ...row,
     user_teams: (row.user_teams_raw || '').split('|||').filter(Boolean)
   }));
-  res.json(rows);
+
+  // Append public holiday pseudo-events for the same date range
+  let phQuery = 'SELECT * FROM public_holidays WHERE 1=1';
+  const phParams = [];
+  if (date) {
+    phQuery += ' AND date = ?'; phParams.push(date);
+  } else if (year && month) {
+    const y = parseInt(year), m = parseInt(month);
+    const first = `${y}-${String(m).padStart(2,'0')}-01`;
+    const last  = new Date(y, m, 0).toISOString().split('T')[0];
+    phQuery += ' AND date >= ? AND date <= ?'; phParams.push(first, last);
+  }
+  const publicHols = db.prepare(phQuery).all(...phParams);
+  const phRows = publicHols.map(ph => ({
+    id: `ph-${ph.id}`,
+    user_id: null,
+    user_name: ph.name,
+    avatar_color: '#059669',
+    start_date: ph.date,
+    end_date: ph.date,
+    type: 'public_holiday',
+    status: 'approved',
+    half_day: null,
+    notes: 'Public holiday',
+    user_teams: [],
+    is_public_holiday: true,
+  }));
+
+  res.json([...rows, ...phRows]);
 });
 
 app.post('/api/holidays', auth, (req, res) => {
@@ -454,6 +499,12 @@ app.post('/api/holidays', auth, (req, res) => {
     AND start_date<=? AND end_date>=?
   `).get(targetUserId, end_date, start_date);
   if (overlap) return res.status(409).json({ error: 'Dates overlap with an existing request' });
+
+  const rawDays = db.prepare('SELECT workdays(?,?) AS w').get(start_date, end_date).w;
+  const phOverlap = countPublicHolidayOverlap(start_date, end_date);
+  if (Math.max(0, rawDays - phOverlap) === 0 && rawDays > 0) {
+    return res.status(400).json({ error: 'Your selected dates consist entirely of public holidays. No leave days would be deducted.' });
+  }
 
   const { lastInsertRowid } = db.prepare(
     'INSERT INTO holidays (user_id,start_date,end_date,type,notes,half_day) VALUES (?,?,?,?,?,?)'
@@ -519,6 +570,42 @@ app.put('/api/quotas/:userId', auth, adminOrManager, (req, res) => {
     'INSERT INTO quotas (user_id,total_days) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET total_days=excluded.total_days'
   ).run(userId, total_days);
   res.json({ user_id: userId, total_days });
+});
+
+// ─── Public Holidays ──────────────────────────────────────────────────────────
+
+app.get('/api/public-holidays', auth, (req, res) => {
+  const { year } = req.query;
+  let q = 'SELECT * FROM public_holidays';
+  const p = [];
+  if (year) { q += ' WHERE date LIKE ?'; p.push(`${year}-%`); }
+  q += ' ORDER BY date ASC';
+  res.json(db.prepare(q).all(...p));
+});
+
+app.post('/api/public-holidays', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, date } = req.body || {};
+  if (!name || !date) return res.status(400).json({ error: 'Name and date are required' });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Date must be YYYY-MM-DD' });
+  try {
+    const { lastInsertRowid } = db.prepare(
+      'INSERT INTO public_holidays (name, date, created_by) VALUES (?,?,?)'
+    ).run(name.trim(), date, req.user.id);
+    res.status(201).json(db.prepare('SELECT * FROM public_holidays WHERE id=?').get(lastInsertRowid));
+  } catch (e) {
+    if (e.message?.includes('UNIQUE')) return res.status(409).json({ error: 'A public holiday already exists on that date' });
+    throw e;
+  }
+});
+
+app.delete('/api/public-holidays/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const id = parseInt(req.params.id);
+  const ph = db.prepare('SELECT id FROM public_holidays WHERE id=?').get(id);
+  if (!ph) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM public_holidays WHERE id=?').run(id);
+  res.json({ success: true });
 });
 
 // ─── Teams ────────────────────────────────────────────────────────────────────

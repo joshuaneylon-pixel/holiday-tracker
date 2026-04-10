@@ -26,12 +26,14 @@ const S = {
   // Team filter
   teamFilter: null,
   // Data cache
-  myHolidays:   [],
-  teamHolidays: [],
-  allHolidays:  [],
+  myHolidays:      [],
+  teamHolidays:    [],
+  allHolidays:     [],
   allUsers:        [],
   allTeams:        [],
+  publicHolidays:  [],
   selectedUserId:  null,
+  staffTab:        'staff',
 };
 
 // ─── Modal / ephemeral state ──────────────────────────────────────────────────
@@ -49,6 +51,10 @@ async function api(method, path, body) {
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
   return data;
+}
+
+async function loadPublicHolidays(year) {
+  S.publicHolidays = await api('GET', `/public-holidays?year=${year}`);
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -278,7 +284,8 @@ async function viewDashboard() {
   const today = todayStr();
   const [myHols, rawTodayOff] = await Promise.all([
     api('GET', `/holidays?userId=${u.id}`),
-    api('GET', `/holidays/team?date=${today}`)
+    api('GET', `/holidays/team?date=${today}`),
+    loadPublicHolidays(S.myYear),
   ]);
   S.myHolidays = myHols;
 
@@ -411,7 +418,13 @@ async function viewDashboard() {
     </div>
   `;
 
-  renderMiniCal(S.myHolidays.filter(h => overlapsMonth(h, S.myYear, S.myMonth)));
+  const phForMiniMonth = S.publicHolidays
+    .filter(ph => ph.date.startsWith(`${S.myYear}-${pad(S.myMonth)}`))
+    .map(ph => ({ start_date: ph.date, end_date: ph.date, type: 'public_holiday', status: 'approved', is_public_holiday: true }));
+  renderMiniCal([
+    ...S.myHolidays.filter(h => overlapsMonth(h, S.myYear, S.myMonth)),
+    ...phForMiniMonth,
+  ]);
 }
 
 function dashCalPrev() {
@@ -443,14 +456,17 @@ function renderMiniCal(holidays) {
     const ds = `${y}-${pad(m)}-${pad(d)}`;
     const dow = new Date(y, m - 1, d).getDay();
     const dayHols = holidays.filter(h => h.start_date <= ds && h.end_date >= ds);
-    const hasPending  = dayHols.some(h => h.status === 'pending');
-    const hasApproved = dayHols.some(h => h.status === 'approved');
+    const hasPending    = dayHols.some(h => h.status === 'pending' && !h.is_public_holiday);
+    const hasApproved   = dayHols.some(h => h.status === 'approved' && !h.is_public_holiday);
+    const hasPublicHol  = dayHols.some(h => h.is_public_holiday);
     const cls = ['mini-cal-day',
       (dow === 0 || dow === 6) ? 'weekend' : '',
       ds === today ? 'today' : '',
+      hasPublicHol ? 'has-public-holiday' : '',
       hasApproved ? 'has-holiday' : hasPending ? 'has-holiday pending' : '',
     ].filter(Boolean).join(' ');
-    html += `<div class="${cls}" title="${hasApproved ? 'Approved holiday' : hasPending ? 'Pending request' : ''}">${d}</div>`;
+    const titleParts = [hasPublicHol ? dayHols.find(h => h.is_public_holiday)?.user_name || 'Public holiday' : '', hasApproved ? 'Approved holiday' : hasPending ? 'Pending request' : ''].filter(Boolean);
+    html += `<div class="${cls}" title="${escHtml(titleParts.join(' · '))}">${d}</div>`;
   }
 
   html += '</div>';
@@ -463,9 +479,18 @@ async function viewMyHolidays() {
   const main = document.getElementById('main-content');
   main.innerHTML = `<div class="loading-view"><div class="spinner dark"></div></div>`;
 
-  S.myHolidays = await api('GET', `/holidays?userId=${S.user.id}`);
+  [S.myHolidays] = await Promise.all([
+    api('GET', `/holidays?userId=${S.user.id}`),
+    loadPublicHolidays(S.myYear),
+  ]);
 
-  const calHols  = S.myHolidays.filter(h => overlapsMonth(h, S.myYear, S.myMonth));
+  const phForMonth = S.publicHolidays
+    .filter(ph => ph.date.startsWith(`${S.myYear}-${pad(S.myMonth)}`))
+    .map(ph => ({ start_date: ph.date, end_date: ph.date, type: 'public_holiday', status: 'approved', is_public_holiday: true, user_name: ph.name }));
+  const calHols  = [
+    ...S.myHolidays.filter(h => overlapsMonth(h, S.myYear, S.myMonth)),
+    ...phForMonth,
+  ];
   const allSorted = [...S.myHolidays].sort((a, b) => b.start_date.localeCompare(a.start_date));
 
   main.innerHTML = `
@@ -497,6 +522,10 @@ async function viewMyHolidays() {
           <div class="legend-item">
             <div class="legend-dot" style="background:#D97706;opacity:0.5"></div>
             Pending approval
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background:#059669"></div>
+            Public Holiday
           </div>
         </div>
       </div>
@@ -612,7 +641,7 @@ async function viewTeam() {
 
 function buildTeamCalSection(holidays) {
   const userMap = {};
-  holidays.forEach(h => { if (!userMap[h.user_id]) userMap[h.user_id] = { id: h.user_id, name: h.user_name, color: h.avatar_color }; });
+  holidays.forEach(h => { if (h.user_id && !userMap[h.user_id]) userMap[h.user_id] = { id: h.user_id, name: h.user_name, color: h.avatar_color }; });
   const users = Object.values(userMap);
 
   const filterLabel = S.teamFilter ? ` · ${escHtml(S.teamFilter)}` : '';
@@ -628,14 +657,18 @@ function buildTeamCalSection(holidays) {
         </div>
       </div>
       ${buildCalendar(S.teamYear, S.teamMonth, holidays, true)}
-      ${users.length > 0 ? `
       <div class="legend">
         ${users.map(u => `
           <div class="legend-item">
             <div class="legend-dot" style="background:${u.color}"></div>
             ${escHtml(u.name)}
           </div>`).join('')}
-      </div>` : ''}
+        ${holidays.some(h => h.is_public_holiday) ? `
+          <div class="legend-item">
+            <div class="legend-dot" style="background:#059669"></div>
+            Public Holiday
+          </div>` : ''}
+      </div>
     </div>
     ${holidays.length === 0 ? `
     <div class="card" style="margin-top:16px">
@@ -664,7 +697,7 @@ function setTeamFilter(name) {
 }
 
 function countUniqUsers(holidays) {
-  return new Set(holidays.map(h => h.user_id)).size;
+  return new Set(holidays.filter(h => !h.is_public_holiday).map(h => h.user_id)).size;
 }
 
 function teamCalPrev() {
@@ -706,15 +739,23 @@ function buildWhoIsOffWidget(people, myTeams, role) {
         <p class="wio-empty-text">Everyone's in today</p>
       </div>`
     : `<div class="wio-list">
-        ${shown.map(h => `
-          <div class="wio-row">
-            <div class="avatar" style="background:${h.avatar_color};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(h.user_name || '')}</div>
-            <div class="wio-info">
-              <div class="wio-name">${escHtml(h.user_name || '')}</div>
-              <div class="wio-meta">${TYPE_LABELS[h.type] || cap(h.type)}</div>
-            </div>
-            ${h.half_day ? `<span class="hd-badge">${h.half_day}</span>` : ''}
-          </div>`).join('')}
+        ${shown.map(h => h.is_public_holiday
+          ? `<div class="wio-row">
+              <div style="background:#D1FAE5;color:#059669;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">🏛</div>
+              <div class="wio-info">
+                <div class="wio-name">${escHtml(h.user_name || 'Public Holiday')}</div>
+                <div class="wio-meta" style="color:#059669">Public Holiday</div>
+              </div>
+            </div>`
+          : `<div class="wio-row">
+              <div class="avatar" style="background:${h.avatar_color};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(h.user_name || '')}</div>
+              <div class="wio-info">
+                <div class="wio-name">${escHtml(h.user_name || '')}</div>
+                <div class="wio-meta">${TYPE_LABELS[h.type] || cap(h.type)}</div>
+              </div>
+              ${h.half_day ? `<span class="hd-badge">${h.half_day}</span>` : ''}
+            </div>`
+        ).join('')}
         ${extra > 0 ? `<div class="wio-more" onclick="navigate('team')">${extra} more → View calendar</div>` : ''}
       </div>`;
 
@@ -858,14 +899,28 @@ async function viewStaff() {
   if (!isPriv()) return navigate('dashboard');
   const main = document.getElementById('main-content');
   main.innerHTML = `<div class="loading-view"><div class="spinner dark"></div></div>`;
-  const [users, teams] = await Promise.all([api('GET', '/users'), api('GET', '/teams')]);
+  const fetches = [api('GET', '/users'), api('GET', '/teams')];
+  if (S.user.role === 'admin') fetches.push(loadPublicHolidays(new Date().getFullYear()));
+  const [users, teams] = await Promise.all(fetches);
   S.allUsers = users;
   S.allTeams = teams;
-  drawStaffTable();
+  drawStaffView();
 }
 
-function drawStaffTable() {
+function drawStaffView() {
   const main = document.getElementById('main-content');
+  const isAdmin = S.user.role === 'admin';
+
+  const tabBar = isAdmin ? `
+    <div class="tabs" style="margin-bottom:20px">
+      <div class="tab ${S.staffTab === 'staff' ? 'active' : ''}" onclick="setStaffTab('staff')">Staff</div>
+      <div class="tab ${S.staffTab === 'public-holidays' ? 'active' : ''}" onclick="setStaffTab('public-holidays')">Public Holidays</div>
+    </div>` : '';
+
+  const addBtn = S.staffTab === 'staff' || !isAdmin
+    ? `<button class="btn btn-primary" onclick="openUserModal(null)">${iPlus()} Add Employee</button>`
+    : `<button class="btn btn-primary" onclick="openPublicHolidayModal()">${iPlus()} Add Public Holiday</button>`;
+
   const visibleUsers = S.staffTeamFilter
     ? S.allUsers.filter(u => (u.teams || []).includes(S.staffTeamFilter))
     : S.allUsers;
@@ -874,11 +929,34 @@ function drawStaffTable() {
     <div class="view-header">
       <div>
         <h1 class="view-title">Manage Staff</h1>
-        <p class="view-subtitle">${visibleUsers.length} team member${visibleUsers.length !== 1 ? 's' : ''}</p>
+        <p class="view-subtitle">${S.staffTab === 'staff' || !isAdmin ? `${visibleUsers.length} team member${visibleUsers.length !== 1 ? 's' : ''}` : 'Company-wide public holidays'}</p>
       </div>
-      <button class="btn btn-primary" onclick="openUserModal(null)">${iPlus()} Add Employee</button>
+      ${addBtn}
     </div>
+    ${tabBar}
+    <div id="staff-tab-content"></div>
+  `;
 
+  if (S.staffTab === 'staff' || !isAdmin) {
+    renderStaffTabContent();
+  } else {
+    renderPublicHolidaysTabContent();
+  }
+}
+
+function setStaffTab(tab) {
+  S.staffTab = tab;
+  drawStaffView();
+}
+
+function renderStaffTabContent() {
+  const el = document.getElementById('staff-tab-content');
+  if (!el) return;
+  const visibleUsers = S.staffTeamFilter
+    ? S.allUsers.filter(u => (u.teams || []).includes(S.staffTeamFilter))
+    : S.allUsers;
+
+  el.innerHTML = `
     ${S.allTeams.length > 0 ? `
     <div class="team-filters">
       <button class="team-pill ${!S.staffTeamFilter ? 'active' : ''}" onclick="setStaffTeamFilter(null)">All Teams</button>
@@ -962,6 +1040,105 @@ function drawStaffTable() {
   `;
 }
 
+function renderPublicHolidaysTabContent() {
+  const el = document.getElementById('staff-tab-content');
+  if (!el) return;
+  const phs = S.publicHolidays || [];
+  const dowNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+  el.innerHTML = phs.length === 0
+    ? `<div class="card"><div class="empty-state">
+        <div class="empty-state-icon">🏛</div>
+        <p class="empty-state-title">No public holidays defined</p>
+        <p class="empty-state-text">Add bank holidays to exclude them from leave calculations</p>
+       </div></div>`
+    : `<div class="table-wrap">
+        <table>
+          <thead><tr><th>Date</th><th>Name</th><th>Day</th><th style="text-align:right">Actions</th></tr></thead>
+          <tbody>
+            ${phs.map(ph => {
+              const dow = dowNames[new Date(ph.date + 'T00:00:00').getDay()];
+              return `
+                <tr>
+                  <td style="font-weight:600;font-feature-settings:'tnum'">${fmtDate(ph.date)}</td>
+                  <td>${escHtml(ph.name)}</td>
+                  <td style="color:var(--text-3)">${dow}</td>
+                  <td>
+                    <div class="td-actions">
+                      <button class="btn btn-danger btn-sm" onclick="deletePublicHoliday(${ph.id}, '${escHtml(ph.name).replace(/'/g, "\\'")}')">Remove</button>
+                    </div>
+                  </td>
+                </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+       </div>`;
+}
+
+function openPublicHolidayModal() {
+  showModal(`
+    <div class="modal-header">
+      <span class="modal-title">Add Public Holiday</span>
+      <button class="modal-close" onclick="closeModal()">${iX()}</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-stack">
+        <div class="field">
+          <label class="field-label">Holiday Name</label>
+          <input type="text" class="input" id="ph-name" placeholder="e.g. Christmas Day" />
+        </div>
+        <div class="field">
+          <label class="field-label">Date</label>
+          <input type="date" class="input" id="ph-date" />
+        </div>
+        <div id="ph-err" class="modal-error hidden"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="ph-submit" onclick="submitPublicHoliday()">Add Holiday</button>
+    </div>
+  `);
+  document.getElementById('ph-name').focus();
+}
+
+async function submitPublicHoliday() {
+  const name  = document.getElementById('ph-name')?.value.trim();
+  const date  = document.getElementById('ph-date')?.value;
+  const errEl = document.getElementById('ph-err');
+  const btn   = document.getElementById('ph-submit');
+
+  if (!name || !date) {
+    errEl.textContent = 'Name and date are required.';
+    return errEl.classList.remove('hidden');
+  }
+  errEl.classList.add('hidden');
+  btn.disabled = true;
+
+  try {
+    await api('POST', '/public-holidays', { name, date });
+    closeModal();
+    toast('Public holiday added');
+    await loadPublicHolidays(date.split('-')[0]);
+    renderPublicHolidaysTabContent();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.classList.remove('hidden');
+    btn.disabled = false;
+  }
+}
+
+async function deletePublicHoliday(id, name) {
+  if (!confirm(`Remove "${name}" from public holidays?`)) return;
+  try {
+    await api('DELETE', `/public-holidays/${id}`);
+    toast('Public holiday removed');
+    await loadPublicHolidays(new Date().getFullYear());
+    renderPublicHolidaysTabContent();
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+
 function roleBg(r)     { return { admin: '#FFF0F2', manager: '#FFF7ED', employee: '#F0FDF4' }[r] || '#F5F5F5'; }
 function roleColor(r)  { return { admin: '#C41230', manager: '#C2410C', employee: '#15803D' }[r] || '#555'; }
 function roleBorder(r) { return { admin: '#FECDD3', manager: '#FED7AA', employee: '#BBF7D0' }[r] || '#E5E5E5'; }
@@ -997,6 +1174,9 @@ function buildCalendar(year, month, holidays, isTeam) {
         <div class="cal-events">
           ${shown.map(h => {
             const hdSuffix = h.half_day ? ` · ${h.half_day}` : '';
+            if (h.is_public_holiday) {
+              return `<div class="cal-event cal-event-ph" title="${escHtml(h.user_name || 'Public Holiday')}">${escHtml(h.user_name || 'Holiday')}</div>`;
+            }
             if (isTeam) {
               const inits = initials(h.user_name || '');
               const hdMark = h.half_day ? ` <span style="opacity:.75;font-size:8px">${h.half_day}</span>` : '';
@@ -1143,14 +1323,24 @@ function syncHolDates() {
   if (start && end && start <= end) {
     const halfDay   = document.getElementById('hd-am')?.classList.contains('active') ? 'AM'
                     : document.getElementById('hd-pm')?.classList.contains('active') ? 'PM' : null;
-    const days      = countWorkdays(start, end, halfDay);
+    const rawDays   = countWorkdays(start, end);
+    const phOverlap = (S.publicHolidays || []).filter(ph => {
+      if (ph.date < start || ph.date > end) return false;
+      const dow = new Date(ph.date + 'T00:00:00').getDay();
+      return dow !== 0 && dow !== 6;
+    }).length;
+    const deductibleDays = halfDay ? Math.max(0, rawDays - phOverlap) * 0.5 : Math.max(0, rawDays - phOverlap);
     const bookFor   = _holBehalfOf ? _profileUser : S.user;
     const total     = bookFor?.quota?.total_days ?? bookFor?.total_days ?? 0;
     const usedD     = bookFor?.usedDays ?? bookFor?.used_days ?? 0;
     const remaining = Math.max(0, total - usedD);
-    const after     = remaining - days;
-    reqEl.textContent = days; reqEl.style.color = 'var(--text)';
+    const after     = remaining - deductibleDays;
+    reqEl.textContent = deductibleDays; reqEl.style.color = 'var(--text)';
     aftEl.textContent = after < 0 ? after : after; aftEl.style.color = after < 0 ? 'var(--red)' : 'var(--text)';
+    if (deductibleDays === 0 && rawDays > 0 && warnEl) {
+      warnEl.textContent = '⚠ Your selected dates consist entirely of public holidays — no leave days would be deducted.';
+      warnEl.classList.remove('hidden');
+    }
   } else {
     reqEl.textContent = '—'; reqEl.style.color = 'var(--text-3)';
     aftEl.textContent = '—'; aftEl.style.color = 'var(--text-3)';
@@ -1216,7 +1406,7 @@ async function cancelHoliday(id) {
 
 // ─── User Modal ───────────────────────────────────────────────────────────────
 
-function setStaffTeamFilter(team) { S.staffTeamFilter = team || null; drawStaffTable(); }
+function setStaffTeamFilter(team) { S.staffTeamFilter = team || null; renderStaffTabContent(); }
 
 function openUserModal(userId) {
   const user   = userId ? S.allUsers.find(u => u.id === userId) : null;
@@ -1364,7 +1554,7 @@ async function submitUser(userId) {
 
     closeModal();
     toast(userId ? 'Employee updated successfully' : 'Employee added successfully');
-    drawStaffTable();
+    renderStaffTabContent();
   } catch (err) {
     errEl.textContent = err.message;
     errEl.classList.remove('hidden');
@@ -1379,7 +1569,7 @@ async function deleteUser(id, name) {
     await api('DELETE', `/users/${id}`);
     S.allUsers = S.allUsers.filter(u => u.id !== id);
     toast(`${name} removed`);
-    drawStaffTable();
+    renderStaffTabContent();
   } catch (err) { toast(err.message, 'error'); }
 }
 

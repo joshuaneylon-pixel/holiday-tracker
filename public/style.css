@@ -769,6 +769,9 @@ tbody tr:hover td { background: #FAFAF9; }
 /* Calendar half-day event styling */
 .cal-event-half { opacity: 0.75; border-left: 2px solid rgba(255,255,255,0.5); }
 
+/* Public holiday calendar events */
+.cal-event-ph { background: #059669 !important; color: #fff !important; font-style: italic; }
+
 /* ─── Who's Off Today widget ─────────────────────────────────────────────── */
 .wio-card { overflow: hidden; }
 .wio-count { background: var(--red); color: white; border-radius: 20px; padding: 2px 9px; font-size: 11px; font-weight: 700; flex-shrink: 0; }
@@ -897,6 +900,7 @@ tbody tr:hover td { background: #FAFAF9; }
 .mini-cal-day.today { background: var(--red) !important; color: white !important; font-weight: 700; border-radius: 50%; }
 .mini-cal-day.has-holiday { background: var(--red-subtle); color: var(--red); font-weight: 600; }
 .mini-cal-day.has-holiday.pending { background: var(--amber-bg); color: var(--amber); }
+.mini-cal-day.has-public-holiday { background: #D1FAE5; color: #065F46; font-weight: 600; }
 
 /* ─── Holiday List Items ─────────────────────────────────────────────────── */
 .holiday-list { display: flex; flex-direction: column; gap: 10px; }
