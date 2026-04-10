@@ -81,27 +81,11 @@ describe('PATCH /api/users/:id', () => {
     expect(res.body.name).toBe('Updated Name');
   });
 
-  test('manager can update team member', async () => {
+  test('manager cannot update any user', async () => {
     const res = await request(env.app)
       .patch(`/api/users/${env.emp.id}`)
       .set('Authorization', `Bearer ${env.mgrToken}`)
       .send({ name: 'Manager Updated' });
-    expect(res.status).toBe(200);
-  });
-
-  test('manager cannot update user outside their team', async () => {
-    const res = await request(env.app)
-      .patch(`/api/users/${env.emp2.id}`)
-      .set('Authorization', `Bearer ${env.mgrToken}`)
-      .send({ name: 'Hacked' });
-    expect(res.status).toBe(403);
-  });
-
-  test('manager cannot change a team member role', async () => {
-    const res = await request(env.app)
-      .patch(`/api/users/${env.emp.id}`)
-      .set('Authorization', `Bearer ${env.mgrToken}`)
-      .send({ role: 'manager' });
     expect(res.status).toBe(403);
   });
 

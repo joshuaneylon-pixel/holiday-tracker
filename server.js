@@ -292,13 +292,10 @@ app.post('/api/users', auth, (req, res) => {
   }
 });
 
-app.patch('/api/users/:id', auth, adminOrManager, (req, res) => {
+app.patch('/api/users/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Only admins can edit staff' });
   const id = parseInt(req.params.id);
   const { name, email, role, department, job_title, password, avatar_color, total_days, teams } = req.body || {};
-
-  // Managers can only edit their own team members
-  if (req.user.role === 'manager' && id !== req.user.id && !canManageUser(req.user, id))
-    return res.status(403).json({ error: 'Forbidden' });
 
   const user = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color FROM users WHERE id=?').get(id);
   if (!user) return res.status(404).json({ error: 'User not found' });

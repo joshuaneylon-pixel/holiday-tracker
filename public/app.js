@@ -1027,7 +1027,7 @@ function renderStaffTabContent() {
                     <td>
                       <div class="td-actions">
                         <button class="btn btn-ghost btn-sm" onclick="goToUserProfile(${u.id})" title="View holidays">${iPerson()} View</button>
-                        <button class="btn btn-ghost btn-sm" onclick="openUserModal(${u.id})">Edit</button>
+                        ${S.user.role === 'admin' ? `<button class="btn btn-ghost btn-sm" onclick="openUserModal(${u.id})">Edit</button>` : ''}
                         ${S.user.role === 'admin' && u.id !== S.user.id
                           ? `<button class="btn btn-danger btn-sm" onclick="deleteUser(${u.id}, '${escHtml(u.name)}')">Remove</button>`
                           : ''}
