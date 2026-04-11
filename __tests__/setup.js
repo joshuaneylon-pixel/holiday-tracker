@@ -6,11 +6,11 @@
 process.env.DB_PATH = ':memory:';
 
 async function createTestEnv() {
-  let app, db;
+  let app, db, performAnnualReset;
 
   // jest.isolateModules gives us a truly fresh module (and fresh :memory: DB) each call
   jest.isolateModules(() => {
-    ({ app, db } = require('../server'));
+    ({ app, db, performAnnualReset } = require('../server'));
   });
 
   const bcrypt = require('bcryptjs');
@@ -52,6 +52,7 @@ async function createTestEnv() {
   return {
     app,
     db,
+    performAnnualReset,
     admin, adminToken: makeToken(admin),
     mgr,   mgrToken:   makeToken(mgr),
     emp,   empToken:   makeToken(emp),

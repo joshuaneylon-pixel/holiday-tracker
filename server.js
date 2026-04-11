@@ -79,6 +79,22 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_by INTEGER REFERENCES users(id)
   );
+
+  CREATE TABLE IF NOT EXISTS announcements (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    title      TEXT    NOT NULL,
+    message    TEXT    NOT NULL,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS teams (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                        TEXT    NOT NULL UNIQUE,
+    manager_id                  INTEGER REFERENCES users(id),
+    admin_id                    INTEGER REFERENCES users(id),
+    requires_secondary_approval INTEGER NOT NULL DEFAULT 0
+  );
 `);
 
 // Migrate any existing department strings → team_members rows
@@ -93,6 +109,33 @@ try { db.exec(`ALTER TABLE holidays ADD COLUMN half_day TEXT DEFAULT NULL`); } c
 // Migrate: add job_title column if it doesn't exist yet
 try { db.exec(`ALTER TABLE users ADD COLUMN job_title TEXT NOT NULL DEFAULT ''`); } catch (_) {}
 
+// Migrate: add carry_allowed, base_days, last_reset_year to quotas
+try { db.exec(`ALTER TABLE quotas ADD COLUMN carry_allowed INTEGER NOT NULL DEFAULT 0`); } catch (_) {}
+try { db.exec(`ALTER TABLE quotas ADD COLUMN base_days INTEGER NOT NULL DEFAULT 25`); } catch (_) {}
+try { db.exec(`ALTER TABLE quotas ADD COLUMN last_reset_year INTEGER DEFAULT NULL`); } catch (_) {}
+// Sync base_days to match total_days for any rows where they differ (new column defaulted to 25)
+db.prepare(`UPDATE quotas SET base_days = total_days WHERE base_days != total_days`).run();
+// Mark existing rows as already reset this year so the first deploy doesn't trigger a reset
+db.prepare(`UPDATE quotas SET last_reset_year = ? WHERE last_reset_year IS NULL`).run(new Date().getFullYear());
+
+// Migrate: add manager_approved_by/at columns to holidays
+try { db.exec(`ALTER TABLE holidays ADD COLUMN manager_approved_by INTEGER REFERENCES users(id)`); } catch (_) {}
+try { db.exec(`ALTER TABLE holidays ADD COLUMN manager_approved_at TEXT`); } catch (_) {}
+
+// Migrate: populate teams table from distinct team_members entries
+{
+  const distinctTeams = db.prepare(`SELECT DISTINCT team FROM team_members`).all();
+  for (const { team } of distinctTeams) {
+    db.prepare(`INSERT OR IGNORE INTO teams (name) VALUES (?)`).run(team);
+    const mgr = db.prepare(`
+      SELECT u.id FROM users u
+      JOIN team_members tm ON tm.user_id = u.id
+      WHERE tm.team = ? AND u.role = 'manager' LIMIT 1
+    `).get(team);
+    if (mgr) db.prepare(`UPDATE teams SET manager_id = ? WHERE name = ? AND manager_id IS NULL`).run(mgr.id, team);
+  }
+}
+
 
 // Seed default admin on first run
 const adminExists = db.prepare("SELECT id FROM users WHERE role='admin' LIMIT 1").get();
@@ -101,8 +144,10 @@ if (!adminExists) {
   const { lastInsertRowid } = db.prepare(
     `INSERT INTO users (name, email, password_hash, role, avatar_color) VALUES (?,?,?,'admin','#C41230')`
   ).run('Admin', 'admin@company.com', hash);
-  db.prepare('INSERT INTO quotas (user_id, total_days) VALUES (?,25)').run(lastInsertRowid);
+  db.prepare('INSERT INTO quotas (user_id, total_days, base_days, last_reset_year) VALUES (?,25,25,?)').run(lastInsertRowid, new Date().getFullYear());
 }
+
+performAnnualReset();
 
 // ─── Team Helpers ─────────────────────────────────────────────────────────────
 
@@ -126,6 +171,16 @@ function setUserTeams(userId, teams) {
   }
 }
 
+function holidayRequiresSecondary(holidayUserId) {
+  const rows = db.prepare(`
+    SELECT t.requires_secondary_approval
+    FROM teams t
+    JOIN team_members tm ON tm.team = t.name
+    WHERE tm.user_id = ?
+  `).all(holidayUserId);
+  return rows.some(r => r.requires_secondary_approval);
+}
+
 // ─── Quota/Days Helpers ───────────────────────────────────────────────────────
 
 function countPublicHolidayOverlap(startDate, endDate) {
@@ -138,12 +193,12 @@ function countPublicHolidayOverlap(startDate, endDate) {
   }).length;
 }
 
-function getUsedDays(userId) {
+function getUsedDaysForYear(userId, year) {
   const rows = db.prepare(`
     SELECT start_date, end_date, half_day FROM holidays
     WHERE user_id = ? AND status = 'approved'
-      AND CAST(strftime('%Y', start_date) AS INTEGER) = CAST(strftime('%Y','now') AS INTEGER)
-  `).all(userId);
+      AND CAST(strftime('%Y', start_date) AS INTEGER) = ?
+  `).all(userId, year);
   return rows.reduce((sum, h) => {
     const raw = db.prepare('SELECT workdays(?,?) AS w').get(h.start_date, h.end_date).w;
     const phOverlap = countPublicHolidayOverlap(h.start_date, h.end_date);
@@ -152,11 +207,44 @@ function getUsedDays(userId) {
   }, 0);
 }
 
+function getUsedDays(userId) {
+  return getUsedDaysForYear(userId, new Date().getFullYear());
+}
+
 function enrichUser(u) {
-  const quota    = db.prepare('SELECT total_days FROM quotas WHERE user_id = ?').get(u.id);
+  const quota    = db.prepare('SELECT total_days, base_days, carry_allowed FROM quotas WHERE user_id = ?').get(u.id);
   const usedDays = getUsedDays(u.id);
   const teams    = getUserTeams(u.id);
-  return { ...u, teams, total_days: quota?.total_days ?? 0, used_days: usedDays };
+  return { ...u, teams, total_days: quota?.total_days ?? 0, base_days: quota?.base_days ?? 0, carry_allowed: quota?.carry_allowed ?? 0, used_days: usedDays };
+}
+
+function performAnnualReset() {
+  const currentYear = new Date().getFullYear();
+  const prevYear    = currentYear - 1;
+
+  const quotas = db.prepare(
+    'SELECT user_id, total_days, base_days, carry_allowed FROM quotas WHERE last_reset_year IS NULL OR last_reset_year < ?'
+  ).all(currentYear);
+
+  if (quotas.length === 0) return;
+
+  const updateStmt = db.prepare(
+    'UPDATE quotas SET total_days = ?, last_reset_year = ? WHERE user_id = ?'
+  );
+
+  db.transaction(() => {
+    for (const q of quotas) {
+      let newTotal = q.base_days;
+      if (q.carry_allowed) {
+        const prevUsed  = getUsedDaysForYear(q.user_id, prevYear);
+        const remaining = Math.max(0, q.total_days - prevUsed);
+        newTotal = q.base_days + remaining;
+      }
+      updateStmt.run(newTotal, currentYear, q.user_id);
+    }
+  })();
+
+  console.log(`  ✦  Annual reset applied for ${quotas.length} user(s) (year ${currentYear})`);
 }
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
@@ -228,7 +316,7 @@ app.get('/api/auth/me', auth, (req, res) => {
   ).get(req.user.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const quota    = db.prepare('SELECT total_days FROM quotas WHERE user_id = ?').get(req.user.id);
+  const quota    = db.prepare('SELECT total_days, base_days, carry_allowed FROM quotas WHERE user_id = ?').get(req.user.id);
   const usedDays = getUsedDays(req.user.id);
   const teams    = getUserTeams(req.user.id);
 
@@ -251,7 +339,8 @@ app.get('/api/auth/me', auth, (req, res) => {
 app.get('/api/users', auth, adminOrManager, (req, res) => {
   let users = db.prepare(`
     SELECT u.id, u.name, u.email, u.role, u.department, u.job_title, u.avatar_color, u.created_at,
-           COALESCE(q.total_days, 0) AS total_days
+           COALESCE(q.total_days, 0) AS total_days,
+           COALESCE(q.carry_allowed, 0) AS carry_allowed
     FROM users u
     LEFT JOIN quotas q ON q.user_id = u.id
     ORDER BY u.name
@@ -268,7 +357,7 @@ app.get('/api/users', auth, adminOrManager, (req, res) => {
 
 app.post('/api/users', auth, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Only admins can add staff' });
-  const { name, email, password, role = 'employee', department = '', job_title = '', total_days = 25, teams = [] } = req.body || {};
+  const { name, email, password, role = 'employee', department = '', job_title = '', total_days = 25, carry_allowed = 0, teams = [] } = req.body || {};
   if (!name || !email || !password)
     return res.status(400).json({ error: 'Name, email and password are required' });
 
@@ -281,11 +370,11 @@ app.post('/api/users', auth, (req, res) => {
       'INSERT INTO users (name,email,password_hash,role,department,job_title,avatar_color) VALUES (?,?,?,?,?,?,?)'
     ).run(name, email.toLowerCase().trim(), hash, role, department, job_title, color);
 
-    db.prepare('INSERT INTO quotas (user_id,total_days) VALUES (?,?)').run(lastInsertRowid, total_days);
+    db.prepare('INSERT INTO quotas (user_id,total_days,base_days,carry_allowed,last_reset_year) VALUES (?,?,?,?,?)').run(lastInsertRowid, total_days, total_days, carry_allowed ? 1 : 0, new Date().getFullYear());
     setUserTeams(lastInsertRowid, teams);
 
     const user = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color FROM users WHERE id=?').get(lastInsertRowid);
-    res.status(201).json({ ...user, teams: getUserTeams(lastInsertRowid), total_days, used_days: 0 });
+    res.status(201).json({ ...user, teams: getUserTeams(lastInsertRowid), total_days, base_days: total_days, carry_allowed: carry_allowed ? 1 : 0, used_days: 0 });
   } catch (e) {
     if (e.message?.includes('UNIQUE')) return res.status(409).json({ error: 'Email already in use' });
     throw e;
@@ -295,7 +384,7 @@ app.post('/api/users', auth, (req, res) => {
 app.patch('/api/users/:id', auth, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Only admins can edit staff' });
   const id = parseInt(req.params.id);
-  const { name, email, role, department, job_title, password, avatar_color, total_days, teams } = req.body || {};
+  const { name, email, role, department, job_title, password, avatar_color, total_days, carry_allowed, teams } = req.body || {};
 
   const user = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color FROM users WHERE id=?').get(id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -320,17 +409,22 @@ app.patch('/api/users/:id', auth, (req, res) => {
     id
   );
 
-  if (total_days !== undefined) {
+  if (total_days !== undefined || carry_allowed !== undefined) {
+    const existing = db.prepare('SELECT total_days, base_days, carry_allowed FROM quotas WHERE user_id = ?').get(id)
+                     || { total_days: 25, base_days: 25, carry_allowed: 0 };
+    const newTotal = total_days !== undefined ? total_days : existing.total_days;
+    const newBase  = total_days !== undefined ? total_days : existing.base_days;
+    const newCarry = carry_allowed !== undefined ? (carry_allowed ? 1 : 0) : existing.carry_allowed;
     db.prepare(
-      'INSERT INTO quotas (user_id,total_days) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET total_days=excluded.total_days'
-    ).run(id, total_days);
+      'INSERT INTO quotas (user_id,total_days,base_days,carry_allowed) VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET total_days=excluded.total_days, base_days=excluded.base_days, carry_allowed=excluded.carry_allowed'
+    ).run(id, newTotal, newBase, newCarry);
   }
 
   if (Array.isArray(teams)) setUserTeams(id, teams);
 
   const updated = db.prepare('SELECT id,name,email,role,department,job_title,avatar_color FROM users WHERE id=?').get(id);
-  const quota   = db.prepare('SELECT total_days FROM quotas WHERE user_id=?').get(id);
-  res.json({ ...updated, teams: getUserTeams(id), total_days: quota?.total_days ?? 0, used_days: getUsedDays(id) });
+  const quota   = db.prepare('SELECT total_days, base_days, carry_allowed FROM quotas WHERE user_id=?').get(id);
+  res.json({ ...updated, teams: getUserTeams(id), total_days: quota?.total_days ?? 0, base_days: quota?.base_days ?? 0, carry_allowed: quota?.carry_allowed ?? 0, used_days: getUsedDays(id) });
 });
 
 app.delete('/api/users/:id', auth, (req, res) => {
@@ -357,10 +451,13 @@ app.get('/api/users/:id/profile', auth, adminOrManager, (req, res) => {
 
   const holidays = db.prepare(`
     SELECT h.*, u.name AS user_name, u.avatar_color,
-           rv.name AS reviewed_by_name
+           rv.name AS reviewed_by_name,
+           mv.name AS manager_approved_by_name,
+           workdays(h.start_date, h.end_date) AS days
     FROM holidays h
     JOIN users u ON u.id = h.user_id
     LEFT JOIN users rv ON rv.id = h.reviewed_by
+    LEFT JOIN users mv ON mv.id = h.manager_approved_by
     WHERE h.user_id = ?
     ORDER BY h.start_date DESC
   `).all(targetId);
@@ -376,10 +473,12 @@ app.get('/api/holidays', auth, (req, res) => {
 
   let q = `SELECT h.*, u.name AS user_name, u.avatar_color, u.department,
            rv.name AS reviewed_by_name,
+           mv.name AS manager_approved_by_name,
            (SELECT GROUP_CONCAT(tm.team,'|||') FROM team_members tm WHERE tm.user_id=h.user_id) AS user_teams_raw
            FROM holidays h
            JOIN users u ON u.id = h.user_id
            LEFT JOIN users rv ON rv.id = h.reviewed_by
+           LEFT JOIN users mv ON mv.id = h.manager_approved_by
            WHERE 1=1`;
   const p = [];
 
@@ -530,16 +629,36 @@ app.patch('/api/holidays/:id/status', auth, adminOrManager, (req, res) => {
   if (!canManageUser(req.user, h.user_id))
     return res.status(403).json({ error: 'You can only manage holidays for your team members' });
 
-  db.prepare(`UPDATE holidays SET status=?, reviewed_at=datetime('now'), reviewed_by=? WHERE id=?`)
-    .run(status, req.user.id, id);
+  // Managers cannot finalise a request already awaiting admin secondary approval
+  if (h.status === 'manager_approved' && req.user.role === 'manager')
+    return res.status(403).json({ error: 'This request is awaiting admin approval' });
+
+  let storedStatus = status;
+  if (status === 'approved' && req.user.role === 'manager' && holidayRequiresSecondary(h.user_id)) {
+    // Intermediate approval — route to admin secondary queue
+    db.prepare(`
+      UPDATE holidays
+      SET status='manager_approved',
+          manager_approved_by=?,
+          manager_approved_at=datetime('now')
+      WHERE id=?
+    `).run(req.user.id, id);
+    storedStatus = 'manager_approved';
+  } else {
+    // Final approval or rejection
+    db.prepare(`UPDATE holidays SET status=?, reviewed_at=datetime('now'), reviewed_by=? WHERE id=?`)
+      .run(status, req.user.id, id);
+  }
 
   const updated = db.prepare(`
     SELECT h.*, u.name AS user_name, u.avatar_color, u.department,
-           rv.name AS reviewed_by_name,
+           rv.name  AS reviewed_by_name,
+           mv.name  AS manager_approved_by_name,
            (SELECT GROUP_CONCAT(tm.team,'|||') FROM team_members tm WHERE tm.user_id=h.user_id) AS user_teams_raw
     FROM holidays h
     JOIN users u ON u.id = h.user_id
     LEFT JOIN users rv ON rv.id = h.reviewed_by
+    LEFT JOIN users mv ON mv.id = h.manager_approved_by
     WHERE h.id=?
   `).get(id);
   res.json({ ...updated, user_teams: (updated.user_teams_raw || '').split('|||').filter(Boolean) });
@@ -565,13 +684,20 @@ app.delete('/api/holidays/:id', auth, (req, res) => {
 // ─── Quotas ───────────────────────────────────────────────────────────────────
 
 app.put('/api/quotas/:userId', auth, adminOrManager, (req, res) => {
-  const { total_days } = req.body || {};
+  const { total_days, carry_allowed } = req.body || {};
   const userId = parseInt(req.params.userId);
   if (!canEditQuota(req.user, userId)) return res.status(403).json({ error: 'Forbidden' });
+  if (carry_allowed !== undefined && req.user.role !== 'admin')
+    return res.status(403).json({ error: 'Only admins can change carry-over settings' });
+  const existing = db.prepare('SELECT total_days, base_days, carry_allowed FROM quotas WHERE user_id = ?').get(userId)
+                   || { total_days: 25, base_days: 25, carry_allowed: 0 };
+  const newTotal = total_days !== undefined ? total_days : existing.total_days;
+  const newBase  = total_days !== undefined ? total_days : existing.base_days;
+  const newCarry = carry_allowed !== undefined ? (carry_allowed ? 1 : 0) : existing.carry_allowed;
   db.prepare(
-    'INSERT INTO quotas (user_id,total_days) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET total_days=excluded.total_days'
-  ).run(userId, total_days);
-  res.json({ user_id: userId, total_days });
+    'INSERT INTO quotas (user_id,total_days,base_days,carry_allowed) VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET total_days=excluded.total_days, base_days=excluded.base_days, carry_allowed=excluded.carry_allowed'
+  ).run(userId, newTotal, newBase, newCarry);
+  res.json({ user_id: userId, total_days: newTotal, base_days: newBase, carry_allowed: newCarry });
 });
 
 // ─── Public Holidays ──────────────────────────────────────────────────────────
@@ -610,6 +736,78 @@ app.delete('/api/public-holidays/:id', auth, (req, res) => {
   res.json({ success: true });
 });
 
+// ─── Announcements ────────────────────────────────────────────────────────────
+
+app.get('/api/announcements', auth, (req, res) => {
+  const rows = db.prepare(`
+    SELECT a.*, u.name AS author_name
+    FROM announcements a
+    JOIN users u ON u.id = a.created_by
+    ORDER BY a.created_at DESC
+  `).all();
+  res.json(rows);
+});
+
+app.post('/api/announcements', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { title, message } = req.body || {};
+  if (!title || !message) return res.status(400).json({ error: 'title and message are required' });
+  const { lastInsertRowid } = db.prepare(
+    'INSERT INTO announcements (title, message, created_by) VALUES (?,?,?)'
+  ).run(title.trim(), message.trim(), req.user.id);
+  res.status(201).json(db.prepare('SELECT * FROM announcements WHERE id=?').get(lastInsertRowid));
+});
+
+app.delete('/api/announcements/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const info = db.prepare('DELETE FROM announcements WHERE id=?').run(parseInt(req.params.id));
+  if (info.changes === 0) return res.status(404).json({ error: 'Not found' });
+  res.json({ success: true });
+});
+
+// ─── Teams Config ─────────────────────────────────────────────────────────────
+
+app.get('/api/teams-config', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const rows = db.prepare(`
+    SELECT t.*,
+           mu.name AS manager_name,
+           au.name AS admin_name
+    FROM teams t
+    LEFT JOIN users mu ON mu.id = t.manager_id
+    LEFT JOIN users au ON au.id = t.admin_id
+    ORDER BY t.name
+  `).all();
+  res.json(rows);
+});
+
+app.patch('/api/teams-config/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const id = parseInt(req.params.id);
+  const team = db.prepare('SELECT id FROM teams WHERE id=?').get(id);
+  if (!team) return res.status(404).json({ error: 'Not found' });
+
+  const { manager_id, admin_id, requires_secondary_approval } = req.body || {};
+  const fields = [];
+  const vals   = [];
+  if (manager_id !== undefined)                  { fields.push('manager_id=?');                  vals.push(manager_id || null); }
+  if (admin_id !== undefined)                    { fields.push('admin_id=?');                    vals.push(admin_id || null); }
+  if (requires_secondary_approval !== undefined) { fields.push('requires_secondary_approval=?'); vals.push(requires_secondary_approval ? 1 : 0); }
+  if (!fields.length) return res.status(400).json({ error: 'Nothing to update' });
+
+  vals.push(id);
+  db.prepare(`UPDATE teams SET ${fields.join(', ')} WHERE id=?`).run(...vals);
+
+  const updated = db.prepare(`
+    SELECT t.*, mu.name AS manager_name, au.name AS admin_name
+    FROM teams t
+    LEFT JOIN users mu ON mu.id = t.manager_id
+    LEFT JOIN users au ON au.id = t.admin_id
+    WHERE t.id=?
+  `).get(id);
+  res.json(updated);
+});
+
 // ─── Teams ────────────────────────────────────────────────────────────────────
 
 app.get('/api/teams', auth, (req, res) => {
@@ -632,4 +830,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app, db };
+module.exports = { app, db, performAnnualReset };
