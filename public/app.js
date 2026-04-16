@@ -36,6 +36,8 @@ const S = {
   teamsConfig:     [],
   selectedUserId:  null,
   staffTab:        'staff',
+  // Who's Off widget
+  wioView:         'today',  // 'today' | 'week'
 };
 
 // ─── Modal / ephemeral state ──────────────────────────────────────────────────
@@ -317,7 +319,7 @@ async function viewDashboard() {
   const today = todayStr();
   const [myHols, rawTodayOff, , announcements] = await Promise.all([
     api('GET', `/holidays?userId=${u.id}`),
-    api('GET', `/holidays/team?date=${today}`),
+    api('GET', wioUrl(S.wioView, today)),
     loadPublicHolidays(S.myYear),
     api('GET', '/announcements'),
   ]);
@@ -368,6 +370,12 @@ async function viewDashboard() {
         <div class="stat-value">${used}</div>
         <div class="stat-sub">${pct}% of allowance</div>
       </div>
+      ${u.offTodayCount !== null && u.offTodayCount !== undefined ? `
+      <div class="stat-card teal">
+        <div class="stat-label">${u.role === 'admin' ? 'Company Off Today' : 'Team Off Today'}</div>
+        <div class="stat-value">${u.offTodayCount}</div>
+        <div class="stat-sub">approved leave${u.offTodayCount !== 1 ? 's' : ''} today</div>
+      </div>` : ''}
     </div>
 
     <div class="dashboard-grid">
@@ -536,7 +544,10 @@ async function viewMyHolidays() {
         <h1 class="view-title">My Holidays</h1>
         <p class="view-subtitle">Your personal time off schedule</p>
       </div>
-      <button class="btn btn-primary" onclick="openHolidayModal()">${iPlus()} New Request</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-ghost" onclick="exportIcs()">↓ Export .ics</button>
+        <button class="btn btn-primary" onclick="openHolidayModal()">${iPlus()} New Request</button>
+      </div>
     </div>
 
     <div class="section">
@@ -602,13 +613,31 @@ function holidayItem(h, showUser = false) {
       <div class="holiday-item-dates">
         ${showUser ? `<div style="font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:2px">${escHtml(h.user_name || '')}</div>` : ''}
         <div class="holiday-item-range">${fmtDate(h.start_date)}${h.half_day ? '' : ` → ${fmtDate(h.end_date)}`}${h.half_day ? `<span class="hd-badge">${h.half_day}</span>` : ''}</div>
-        <div class="holiday-item-meta">${TYPE_LABELS[h.type] || cap(h.type)} · ${dayLabel}${hdLabel}${h.notes ? ` · ${escHtml(h.notes)}` : ''}${h.manager_approved_by_name ? ` · <span style="color:var(--text-3)">Mgr: ${escHtml(h.manager_approved_by_name)}</span>` : ''}${h.reviewed_by_name ? ` · <span style="color:var(--text-3)">${h.status === 'rejected' ? 'Rejected' : 'Approved'} by ${escHtml(h.reviewed_by_name)}</span>` : ''}</div>
+        <div class="holiday-item-meta">${TYPE_LABELS[h.type] || cap(h.type)} · ${dayLabel}${hdLabel}${h.notes ? ` · ${escHtml(h.notes)}` : ''}${h.manager_approved_by_name ? ` · <span style="color:var(--text-3)">Mgr: ${escHtml(h.manager_approved_by_name)}</span>` : ''}${h.reviewed_by_name ? ` · <span style="color:var(--text-3)">${h.status === 'rejected' ? 'Rejected' : 'Approved'} by ${escHtml(h.reviewed_by_name)}</span>` : ''}${h.status === 'rejected' && h.rejection_reason ? `<span class="rejection-reason"> · Reason: ${escHtml(h.rejection_reason)}</span>` : ''}</div>
       </div>
       <div class="holiday-item-actions">
         <span class="badge ${statusBadgeClass(h, S.user?.role)}"><span class="badge-dot"></span>${statusLabel(h, S.user?.role)}</span>
         ${canCancel ? `<button class="btn btn-ghost btn-sm" onclick="cancelHoliday(${h.id})">Cancel</button>` : ''}
       </div>
     </div>`;
+}
+
+async function exportIcs() {
+  try {
+    const res = await fetch('/api/holidays/export/ics', {
+      headers: { Authorization: `Bearer ${S.token}` },
+    });
+    if (!res.ok) throw new Error('Export failed');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'holidays.ics';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) { toast(err.message, 'error'); }
 }
 
 function myCalPrev() {
@@ -817,12 +846,74 @@ async function deleteAnnouncement(id) {
   } catch (err) { toast(err.message, 'error'); }
 }
 
-function buildWhoIsOffWidget(people, myTeams, role) {
-  const MAX = 4;
-  const shown = people.slice(0, MAX);
-  const extra = people.length - MAX;
+function wioUrl(view, today) {
+  if (view === 'week') {
+    const end = new Date();
+    end.setDate(end.getDate() + 6);
+    const endStr = `${end.getFullYear()}-${pad(end.getMonth() + 1)}-${pad(end.getDate())}`;
+    return `/holidays/team?start_date=${today}&end_date=${endStr}`;
+  }
+  return `/holidays/team?date=${today}`;
+}
 
-  // Label shown under the title
+async function setWioView(view) {
+  S.wioView = view;
+  const u = S.user;
+  const myTeams = u.teams || [];
+  const today = todayStr();
+  const rawData = await api('GET', wioUrl(view, today)).catch(() => []);
+  const filtered = (myTeams.length === 0 || u.role === 'admin')
+    ? rawData
+    : rawData.filter(h => (h.user_teams || []).some(t => myTeams.includes(t)));
+  const el = document.getElementById('wio-widget');
+  if (el) el.outerHTML = buildWhoIsOffWidget(filtered, myTeams, u.role);
+}
+
+function buildWioRow(h) {
+  if (h.is_public_holiday) {
+    return `<div class="wio-row">
+      <div style="background:#D1FAE5;color:#059669;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">🏛</div>
+      <div class="wio-info">
+        <div class="wio-name">${escHtml(h.user_name || 'Public Holiday')}</div>
+        <div class="wio-meta" style="color:#059669">Public Holiday</div>
+      </div>
+    </div>`;
+  }
+  return `<div class="wio-row">
+    <div class="avatar" style="background:${h.avatar_color};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(h.user_name || '')}</div>
+    <div class="wio-info">
+      <div class="wio-name">${escHtml(h.user_name || '')}</div>
+      <div class="wio-meta">${TYPE_LABELS[h.type] || cap(h.type)}</div>
+    </div>
+    ${h.half_day ? `<span class="hd-badge">${h.half_day}</span>` : ''}
+  </div>`;
+}
+
+function buildWioWeekBody(people) {
+  const today = todayStr();
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    const ds = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const dayPeople = people.filter(h => h.start_date <= ds && h.end_date >= ds);
+    if (dayPeople.length > 0) days.push({ ds, dayPeople });
+  }
+  if (days.length === 0) {
+    return `<div class="wio-empty"><span class="wio-empty-icon">🎉</span><p class="wio-empty-text">No one off in the next 7 days</p></div>`;
+  }
+  return `<div class="wio-list">${days.map(({ ds, dayPeople }) => `
+    <div class="wio-day-group">
+      <div class="wio-day-label">${fmtDateShort(ds)}</div>
+      ${dayPeople.slice(0, 3).map(buildWioRow).join('')}
+      ${dayPeople.length > 3 ? `<div class="wio-more" onclick="navigate('team')">+${dayPeople.length - 3} more</div>` : ''}
+    </div>`).join('')}</div>`;
+}
+
+function buildWhoIsOffWidget(people, myTeams, role) {
+  const view = S.wioView || 'today';
+  const MAX = 4;
+
   const scopeLabel = role === 'admin'
     ? 'Company-wide'
     : myTeams.length === 1 ? escHtml(myTeams[0])
@@ -833,41 +924,35 @@ function buildWhoIsOffWidget(people, myTeams, role) {
     ? `<span class="wio-count">${people.length} off</span>`
     : '';
 
-  const body = people.length === 0
-    ? `<div class="wio-empty">
-        <span class="wio-empty-icon">🎉</span>
-        <p class="wio-empty-text">Everyone's in today</p>
-      </div>`
-    : `<div class="wio-list">
-        ${shown.map(h => h.is_public_holiday
-          ? `<div class="wio-row">
-              <div style="background:#D1FAE5;color:#059669;width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">🏛</div>
-              <div class="wio-info">
-                <div class="wio-name">${escHtml(h.user_name || 'Public Holiday')}</div>
-                <div class="wio-meta" style="color:#059669">Public Holiday</div>
-              </div>
-            </div>`
-          : `<div class="wio-row">
-              <div class="avatar" style="background:${h.avatar_color};width:34px;height:34px;font-size:12px;flex-shrink:0">${initials(h.user_name || '')}</div>
-              <div class="wio-info">
-                <div class="wio-name">${escHtml(h.user_name || '')}</div>
-                <div class="wio-meta">${TYPE_LABELS[h.type] || cap(h.type)}</div>
-              </div>
-              ${h.half_day ? `<span class="hd-badge">${h.half_day}</span>` : ''}
-            </div>`
-        ).join('')}
-        ${extra > 0 ? `<div class="wio-more" onclick="navigate('team')">${extra} more → View calendar</div>` : ''}
-      </div>`;
+  let body;
+  if (view === 'week') {
+    body = buildWioWeekBody(people);
+  } else {
+    const shown = people.slice(0, MAX);
+    const extra = people.length - MAX;
+    body = people.length === 0
+      ? `<div class="wio-empty"><span class="wio-empty-icon">🎉</span><p class="wio-empty-text">Everyone's in today</p></div>`
+      : `<div class="wio-list">
+          ${shown.map(buildWioRow).join('')}
+          ${extra > 0 ? `<div class="wio-more" onclick="navigate('team')">${extra} more → View calendar</div>` : ''}
+        </div>`;
+  }
+
+  const toggles = `<div class="wio-toggles">
+    <button class="wio-toggle-btn ${view === 'today' ? 'active' : ''}" onclick="setWioView('today')">Today</button>
+    <button class="wio-toggle-btn ${view === 'week' ? 'active' : ''}" onclick="setWioView('week')">Next 7 Days</button>
+  </div>`;
 
   return `
-    <div class="card wio-card">
+    <div class="card wio-card" id="wio-widget">
       <div class="card-header" style="display:flex;align-items:center;justify-content:space-between">
         <div>
-          <div class="card-title">Who's Off Today</div>
+          <div class="card-title">Who's Off</div>
           ${scopeLabel ? `<div style="font-size:11px;color:var(--text-3);margin-top:1px">${scopeLabel}</div>` : ''}
         </div>
         ${countBadge}
       </div>
+      ${toggles}
       ${body}
     </div>`;
 }
@@ -992,8 +1077,15 @@ function setReqTab(tab) { S.reqTab = tab; drawRequestsTable(); }
 function setReqTeamFilter(team) { S.reqTeamFilter = team || null; drawRequestsTable(); }
 
 async function reviewRequest(id, status) {
+  let rejection_reason = null;
+  if (status === 'rejected') {
+    rejection_reason = prompt('Reason for rejection (optional):') ?? null;
+    if (rejection_reason !== null && rejection_reason.trim() === '') rejection_reason = null;
+  }
   try {
-    const updated = await api('PATCH', `/holidays/${id}/status`, { status });
+    const body = { status };
+    if (rejection_reason) body.rejection_reason = rejection_reason;
+    const updated = await api('PATCH', `/holidays/${id}/status`, body);
     const idx = S.allHolidays.findIndex(x => x.id === id);
     if (idx >= 0) S.allHolidays[idx] = { ...S.allHolidays[idx], ...updated };
     if (status === 'approved' || status === 'rejected') {

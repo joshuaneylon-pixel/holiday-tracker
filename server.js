@@ -8,6 +8,28 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'ht-secret-change-in-production';
 
+// ─── Email ────────────────────────────────────────────────────────────────────
+
+let _mailer = null;
+if (process.env.SMTP_HOST && process.env.SMTP_USER) {
+  try {
+    const nodemailer = require('nodemailer');
+    _mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+    console.log('  ✦  Email notifications enabled');
+  } catch (e) { console.warn('[email] nodemailer unavailable:', e.message); }
+}
+
+function sendEmail(to, subject, html) {
+  if (!_mailer || !to) return;
+  _mailer.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html })
+    .catch(err => console.error('[email] Failed to send:', err.message));
+}
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -121,6 +143,9 @@ db.prepare(`UPDATE quotas SET last_reset_year = ? WHERE last_reset_year IS NULL`
 // Migrate: add manager_approved_by/at columns to holidays
 try { db.exec(`ALTER TABLE holidays ADD COLUMN manager_approved_by INTEGER REFERENCES users(id)`); } catch (_) {}
 try { db.exec(`ALTER TABLE holidays ADD COLUMN manager_approved_at TEXT`); } catch (_) {}
+
+// Migrate: add rejection_reason column to holidays
+try { db.exec(`ALTER TABLE holidays ADD COLUMN rejection_reason TEXT DEFAULT NULL`); } catch (_) {}
 
 // Migrate: populate teams table from distinct team_members entries
 {
@@ -321,17 +346,24 @@ app.get('/api/auth/me', auth, (req, res) => {
   const teams    = getUserTeams(req.user.id);
 
   let pendingCount = 0;
+  let offTodayCount = null; // extra stat for managers/admins
+  const today = new Date().toISOString().split('T')[0];
+
   if (req.user.role === 'admin') {
     pendingCount = db.prepare("SELECT COUNT(*) AS n FROM holidays WHERE status='pending'").get().n;
+    offTodayCount = db.prepare(
+      "SELECT COUNT(*) AS n FROM holidays WHERE status='approved' AND start_date<=? AND end_date>=?"
+    ).get(today, today).n;
   } else if (req.user.role === 'manager') {
     const ids = getManagedUserIds(req.user.id);
     if (ids.length > 0) {
       const ph = ids.map(() => '?').join(',');
       pendingCount = db.prepare(`SELECT COUNT(*) AS n FROM holidays WHERE status='pending' AND user_id IN (${ph})`).get(...ids).n;
+      offTodayCount = db.prepare(`SELECT COUNT(*) AS n FROM holidays WHERE status='approved' AND start_date<=? AND end_date>=? AND user_id IN (${ph})`).get(today, today, ...ids).n;
     }
   }
 
-  res.json({ ...user, teams, quota: quota || { total_days: 0 }, usedDays, pendingCount });
+  res.json({ ...user, teams, quota: quota || { total_days: 0 }, usedDays, pendingCount, offTodayCount });
 });
 
 // ─── Users ────────────────────────────────────────────────────────────────────
@@ -539,6 +571,8 @@ app.get('/api/holidays/team', auth, (req, res) => {
 
   if (date) {
     q += ' AND h.start_date<=? AND h.end_date>=?'; p.push(date, date);
+  } else if (req.query.start_date && req.query.end_date) {
+    q += ' AND h.start_date<=? AND h.end_date>=?'; p.push(req.query.end_date, req.query.start_date);
   }
 
   q += ' ORDER BY u.name';
@@ -552,6 +586,8 @@ app.get('/api/holidays/team', auth, (req, res) => {
   const phParams = [];
   if (date) {
     phQuery += ' AND date = ?'; phParams.push(date);
+  } else if (req.query.start_date && req.query.end_date) {
+    phQuery += ' AND date >= ? AND date <= ?'; phParams.push(req.query.start_date, req.query.end_date);
   } else if (year && month) {
     const y = parseInt(year), m = parseInt(month);
     const first = `${y}-${String(m).padStart(2,'0')}-01`;
@@ -575,6 +611,52 @@ app.get('/api/holidays/team', auth, (req, res) => {
   }));
 
   res.json([...rows, ...phRows]);
+});
+
+app.get('/api/holidays/export/ics', auth, (req, res) => {
+  const userId = (req.user.role === 'admin' && req.query.userId)
+    ? parseInt(req.query.userId)
+    : req.user.id;
+
+  const holidays = db.prepare(
+    `SELECT * FROM holidays WHERE user_id = ? AND status = 'approved' ORDER BY start_date`
+  ).all(userId);
+
+  const typeLabels = { annual: 'Annual Leave', unpaid: 'Unpaid Leave', other: 'Other' };
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 15) + 'Z';
+
+  const events = holidays.map(h => {
+    const label = (typeLabels[h.type] || h.type) + (h.half_day ? ` (${h.half_day})` : '');
+    const [ey, em, ed] = h.end_date.split('-').map(Number);
+    const next = new Date(Date.UTC(ey, em - 1, ed + 1));
+    const dtend = `${next.getUTCFullYear()}${String(next.getUTCMonth() + 1).padStart(2, '0')}${String(next.getUTCDate()).padStart(2, '0')}`;
+    const dtstart = h.start_date.replace(/-/g, '');
+    const lines = [
+      'BEGIN:VEVENT',
+      `UID:ht-${h.id}@holiday-tracker`,
+      `DTSTAMP:${stamp}`,
+      `DTSTART;VALUE=DATE:${dtstart}`,
+      `DTEND;VALUE=DATE:${dtend}`,
+      `SUMMARY:${label}`,
+    ];
+    if (h.notes) lines.push(`DESCRIPTION:${h.notes.replace(/[\\,;]/g, s => '\\' + s).replace(/\r?\n/g, '\\n')}`);
+    lines.push('END:VEVENT');
+    return lines.join('\r\n');
+  });
+
+  const cal = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Holiday Tracker//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    ...events,
+    'END:VCALENDAR',
+  ].join('\r\n');
+
+  res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="holidays.ics"');
+  res.send(cal);
 });
 
 app.post('/api/holidays', auth, (req, res) => {
@@ -614,11 +696,29 @@ app.post('/api/holidays', auth, (req, res) => {
   const h = db.prepare(
     'SELECT h.*,u.name AS user_name,u.avatar_color FROM holidays h JOIN users u ON u.id=h.user_id WHERE h.id=?'
   ).get(lastInsertRowid);
+
+  // Notify approvers of the new request (fire-and-forget)
+  if (_mailer) {
+    const requesterName = h.user_name || 'An employee';
+    const typeLabel = { annual: 'Annual Leave', unpaid: 'Unpaid Leave', other: 'Other' }[type] || type;
+    const admins = db.prepare("SELECT email FROM users WHERE role='admin'").all().map(r => r.email);
+    const mgrTeams = getUserTeams(targetUserId);
+    const mgrEmails = mgrTeams.length
+      ? db.prepare(`SELECT DISTINCT u.email FROM users u JOIN team_members tm ON tm.user_id=u.id WHERE tm.team IN (${mgrTeams.map(() => '?').join(',')}) AND u.role='manager'`).all(...mgrTeams).map(r => r.email)
+      : [];
+    const recipients = [...new Set([...admins, ...mgrEmails])].join(',');
+    sendEmail(
+      recipients,
+      `New holiday request from ${requesterName}`,
+      `<p><strong>${requesterName}</strong> has requested <strong>${typeLabel}</strong> from <strong>${start_date}</strong> to <strong>${end_date}</strong>.</p><p>Please log in to review and approve or reject the request.</p>`
+    );
+  }
+
   res.status(201).json(h);
 });
 
 app.patch('/api/holidays/:id/status', auth, adminOrManager, (req, res) => {
-  const { status } = req.body || {};
+  const { status, rejection_reason } = req.body || {};
   if (!['approved', 'rejected'].includes(status))
     return res.status(400).json({ error: 'Status must be approved or rejected' });
 
@@ -646,12 +746,13 @@ app.patch('/api/holidays/:id/status', auth, adminOrManager, (req, res) => {
     storedStatus = 'manager_approved';
   } else {
     // Final approval or rejection
-    db.prepare(`UPDATE holidays SET status=?, reviewed_at=datetime('now'), reviewed_by=? WHERE id=?`)
-      .run(status, req.user.id, id);
+    db.prepare(`UPDATE holidays SET status=?, reviewed_at=datetime('now'), reviewed_by=?, rejection_reason=? WHERE id=?`)
+      .run(status, req.user.id, status === 'rejected' ? (rejection_reason || null) : null, id);
   }
 
   const updated = db.prepare(`
     SELECT h.*, u.name AS user_name, u.avatar_color, u.department,
+           u.email AS user_email,
            rv.name  AS reviewed_by_name,
            mv.name  AS manager_approved_by_name,
            (SELECT GROUP_CONCAT(tm.team,'|||') FROM team_members tm WHERE tm.user_id=h.user_id) AS user_teams_raw
@@ -661,6 +762,24 @@ app.patch('/api/holidays/:id/status', auth, adminOrManager, (req, res) => {
     LEFT JOIN users mv ON mv.id = h.manager_approved_by
     WHERE h.id=?
   `).get(id);
+
+  // Notify the employee of the decision (fire-and-forget)
+  if (_mailer && updated.user_email) {
+    const typeLabel = { annual: 'Annual Leave', unpaid: 'Unpaid Leave', other: 'Other' }[updated.type] || updated.type;
+    let subj, body;
+    if (storedStatus === 'manager_approved') {
+      subj = 'Holiday request: manager approved';
+      body = `<p>Your <strong>${typeLabel}</strong> request (${updated.start_date} → ${updated.end_date}) has been approved by your manager and is now awaiting final admin approval.</p>`;
+    } else if (storedStatus === 'approved') {
+      subj = 'Holiday request approved';
+      body = `<p>Your <strong>${typeLabel}</strong> request (${updated.start_date} → ${updated.end_date}) has been <strong style="color:#059669">approved</strong>. Enjoy your time off!</p>`;
+    } else {
+      subj = 'Holiday request rejected';
+      body = `<p>Your <strong>${typeLabel}</strong> request (${updated.start_date} → ${updated.end_date}) has been <strong style="color:#C41230">rejected</strong>.</p>${updated.rejection_reason ? `<p>Reason: ${updated.rejection_reason}</p>` : ''}`;
+    }
+    sendEmail(updated.user_email, subj, body);
+  }
+
   res.json({ ...updated, user_teams: (updated.user_teams_raw || '').split('|||').filter(Boolean) });
 });
 
