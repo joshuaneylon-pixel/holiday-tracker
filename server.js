@@ -147,6 +147,10 @@ try { db.exec(`ALTER TABLE holidays ADD COLUMN manager_approved_at TEXT`); } cat
 // Migrate: add rejection_reason column to holidays
 try { db.exec(`ALTER TABLE holidays ADD COLUMN rejection_reason TEXT DEFAULT NULL`); } catch (_) {}
 
+// Migrate: add delegation columns to users
+try { db.exec(`ALTER TABLE users ADD COLUMN delegate_to INTEGER REFERENCES users(id)`); } catch (_) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN delegate_until TEXT DEFAULT NULL`); } catch (_) {}
+
 // Migrate: populate teams table from distinct team_members entries
 {
   const distinctTeams = db.prepare(`SELECT DISTINCT team FROM team_members`).all();
@@ -185,6 +189,18 @@ function getManagedUserIds(managerId) {
   if (teams.length === 0) return [];
   const ph = teams.map(() => '?').join(',');
   return db.prepare(`SELECT DISTINCT user_id FROM team_members WHERE team IN (${ph})`).all(...teams).map(r => r.user_id);
+}
+
+// Like getManagedUserIds but also includes users managed by any manager who has
+// delegated approval authority to this user (and whose delegation is still active).
+function getEffectiveManagedUserIds(userId) {
+  const direct = getManagedUserIds(userId);
+  const today = new Date().toISOString().split('T')[0];
+  const delegators = db.prepare(
+    `SELECT id FROM users WHERE delegate_to = ? AND (delegate_until IS NULL OR delegate_until >= ?)`
+  ).all(userId, today).map(r => r.id);
+  const delegated = delegators.flatMap(dId => getManagedUserIds(dId));
+  return [...new Set([...direct, ...delegated])];
 }
 
 function setUserTeams(userId, teams) {
@@ -298,7 +314,7 @@ function canManageUser(reqUser, targetUserId) {
     // Managers cannot manage admins
     const target = db.prepare('SELECT role FROM users WHERE id=?').get(targetUserId);
     if (target && target.role === 'admin') return false;
-    return getManagedUserIds(reqUser.id).includes(targetUserId);
+    return getEffectiveManagedUserIds(reqUser.id).includes(targetUserId);
   }
   return false;
 }
@@ -355,7 +371,7 @@ app.get('/api/auth/me', auth, (req, res) => {
       "SELECT COUNT(*) AS n FROM holidays WHERE status='approved' AND start_date<=? AND end_date>=?"
     ).get(today, today).n;
   } else if (req.user.role === 'manager') {
-    const ids = getManagedUserIds(req.user.id);
+    const ids = getEffectiveManagedUserIds(req.user.id);
     if (ids.length > 0) {
       const ph = ids.map(() => '?').join(',');
       pendingCount = db.prepare(`SELECT COUNT(*) AS n FROM holidays WHERE status='pending' AND user_id IN (${ph})`).get(...ids).n;
@@ -363,7 +379,19 @@ app.get('/api/auth/me', auth, (req, res) => {
     }
   }
 
-  res.json({ ...user, teams, quota: quota || { total_days: 0 }, usedDays, pendingCount, offTodayCount });
+  // Include active delegation info for managers
+  let delegation = null;
+  if (req.user.role === 'manager') {
+    const me = db.prepare('SELECT delegate_to, delegate_until FROM users WHERE id = ?').get(req.user.id);
+    if (me?.delegate_to) {
+      const delegate = db.prepare('SELECT id, name FROM users WHERE id = ?').get(me.delegate_to);
+      if (delegate && (!me.delegate_until || me.delegate_until >= today)) {
+        delegation = { delegate_to: delegate.id, delegate_to_name: delegate.name, delegate_until: me.delegate_until };
+      }
+    }
+  }
+
+  res.json({ ...user, teams, quota: quota || { total_days: 0 }, usedDays, pendingCount, offTodayCount, delegation });
 });
 
 // ─── Users ────────────────────────────────────────────────────────────────────
@@ -497,6 +525,28 @@ app.get('/api/users/:id/profile', auth, adminOrManager, (req, res) => {
   res.json({ user: enrichUser(user), holidays });
 });
 
+// ─── Delegation ───────────────────────────────────────────────────────────────
+
+app.patch('/api/users/me/delegate', auth, (req, res) => {
+  if (req.user.role !== 'manager') return res.status(403).json({ error: 'Only managers can delegate' });
+  const { delegate_to, delegate_until } = req.body || {};
+
+  if (delegate_to === null || delegate_to === undefined) {
+    db.prepare('UPDATE users SET delegate_to = NULL, delegate_until = NULL WHERE id = ?').run(req.user.id);
+    return res.json({ delegation: null });
+  }
+
+  const targetId = parseInt(delegate_to);
+  if (targetId === req.user.id) return res.status(400).json({ error: 'Cannot delegate to yourself' });
+  const target = db.prepare('SELECT id, name, role FROM users WHERE id = ?').get(targetId);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (target.role === 'employee') return res.status(400).json({ error: 'Can only delegate to a manager or admin' });
+
+  const until = delegate_until || null;
+  db.prepare('UPDATE users SET delegate_to = ?, delegate_until = ? WHERE id = ?').run(targetId, until, req.user.id);
+  res.json({ delegation: { delegate_to: target.id, delegate_to_name: target.name, delegate_until: until } });
+});
+
 // ─── Holidays ─────────────────────────────────────────────────────────────────
 
 app.get('/api/holidays', auth, (req, res) => {
@@ -518,8 +568,8 @@ app.get('/api/holidays', auth, (req, res) => {
     // Employees see only their own
     q += ' AND h.user_id=?'; p.push(req.user.id);
   } else if (req.user.role === 'manager') {
-    // Managers see only their team members
-    const ids = getManagedUserIds(req.user.id);
+    // Managers see only their team members (including via active delegation)
+    const ids = getEffectiveManagedUserIds(req.user.id);
     if (ids.length === 0) return res.json([]);
     const ph = ids.map(() => '?').join(',');
     q += ` AND h.user_id IN (${ph})`; p.push(...ids);
@@ -938,6 +988,87 @@ app.get('/api/teams', auth, (req, res) => {
     teams = getUserTeams(req.user.id);
   }
   res.json(teams);
+});
+
+// ─── Reports ──────────────────────────────────────────────────────────────────
+
+app.get('/api/reports/summary', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const year = parseInt(req.query.year || new Date().getFullYear());
+
+  const users = db.prepare(`
+    SELECT u.id, u.name, u.role, u.job_title, COALESCE(q.total_days, 0) AS total_days
+    FROM users u
+    LEFT JOIN quotas q ON q.user_id = u.id
+    ORDER BY u.name
+  `).all();
+
+  const userData = users.map(u => {
+    const used = getUsedDaysForYear(u.id, year);
+    const teams = getUserTeams(u.id);
+    return { ...u, used_days: used, remaining: Math.max(0, u.total_days - used), teams };
+  });
+
+  const teams = db.prepare('SELECT DISTINCT team FROM team_members ORDER BY team').all().map(r => r.team);
+  const teamData = teams.map(team => {
+    const members = db.prepare(`
+      SELECT DISTINCT u.id, COALESCE(q.total_days, 0) AS total_days
+      FROM users u JOIN team_members tm ON tm.user_id = u.id
+      LEFT JOIN quotas q ON q.user_id = u.id
+      WHERE tm.team = ?
+    `).all(team);
+    const totalAllowance = members.reduce((s, m) => s + m.total_days, 0);
+    const totalUsed      = members.reduce((s, m) => s + getUsedDaysForYear(m.id, year), 0);
+    const pct = totalAllowance > 0 ? Math.round(totalUsed / totalAllowance * 100) : 0;
+    return { team, memberCount: members.length, totalAllowance, totalUsed, pct };
+  });
+
+  res.json({ year, users: userData, teams: teamData });
+});
+
+app.get('/api/reports/monthly', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const year = parseInt(req.query.year || new Date().getFullYear());
+
+  const rows = db.prepare(`
+    SELECT CAST(strftime('%m', start_date) AS INTEGER) AS month,
+           type,
+           SUM(workdays(start_date, end_date) * CASE WHEN half_day IS NOT NULL THEN 0.5 ELSE 1 END) AS days
+    FROM holidays
+    WHERE status = 'approved'
+      AND CAST(strftime('%Y', start_date) AS INTEGER) = ?
+    GROUP BY month, type
+    ORDER BY month
+  `).all(year);
+
+  res.json({ year, data: rows });
+});
+
+app.get('/api/reports/export/csv', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const year = parseInt(req.query.year || new Date().getFullYear());
+
+  const users = db.prepare(`
+    SELECT u.id, u.name, u.email, u.role, u.job_title, COALESCE(q.total_days, 0) AS total_days
+    FROM users u LEFT JOIN quotas q ON q.user_id = u.id
+    ORDER BY u.name
+  `).all();
+
+  const header = ['Name', 'Email', 'Role', 'Job Title', 'Teams', 'Total Days', 'Days Used', 'Days Remaining', '% Used'];
+  const csvEsc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+
+  const rows = [header.map(csvEsc).join(',')];
+  for (const u of users) {
+    const used      = getUsedDaysForYear(u.id, year);
+    const remaining = Math.max(0, u.total_days - used);
+    const pct       = u.total_days > 0 ? Math.round(used / u.total_days * 100) : 0;
+    const teams     = getUserTeams(u.id).join('; ');
+    rows.push([u.name, u.email, u.role, u.job_title, teams, u.total_days, used, remaining, `${pct}%`].map(csvEsc).join(','));
+  }
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="holiday-report-${year}.csv"`);
+  res.send(rows.join('\n'));
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
