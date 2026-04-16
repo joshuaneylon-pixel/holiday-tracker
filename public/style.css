@@ -1289,6 +1289,96 @@ tbody tr:hover td { background: #FAFAF9; }
   font-style: italic;
 }
 
+/* ─── Reports ────────────────────────────────────────────────────────────── */
+.report-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+@media (max-width: 900px) { .report-grid { grid-template-columns: 1fr; } }
+
+/* Vertical bar chart (monthly) */
+.bar-chart-v {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 160px;
+  padding-bottom: 0;
+}
+.bar-v-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+  height: 100%;
+}
+.bar-v-wrap {
+  flex: 1;
+  width: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.bar-v-fill {
+  width: 100%;
+  background: var(--red);
+  border-radius: 3px 3px 0 0;
+  min-height: 2px;
+  transition: height 0.3s ease;
+}
+.bar-v-label {
+  font-size: 10px;
+  color: var(--text-3);
+  margin-top: 4px;
+  text-align: center;
+}
+.bar-v-val {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-2);
+  min-height: 14px;
+  text-align: center;
+}
+
+/* Horizontal bar chart (teams) */
+.report-team-list { display: flex; flex-direction: column; gap: 12px; }
+.bar-h-row { display: flex; align-items: center; gap: 10px; }
+.bar-h-label {
+  width: 90px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.bar-h-track {
+  flex: 1;
+  height: 10px;
+  background: var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.bar-h-fill {
+  height: 100%;
+  background: var(--red);
+  border-radius: 5px;
+  transition: width 0.3s ease;
+  min-width: 2px;
+}
+.bar-h-stat {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 130px;
+  text-align: right;
+}
+
+/* ─── Delegation card ────────────────────────────────────────────────────── */
+.delegate-card { border-left: 3px solid var(--blue); }
+
 /* ─── Print ───────────────────────────────────────────────────────────────── */
 @media print {
   .sidebar, nav, .btn, button { display: none !important; }

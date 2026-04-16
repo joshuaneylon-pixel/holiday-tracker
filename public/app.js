@@ -38,6 +38,8 @@ const S = {
   staffTab:        'staff',
   // Who's Off widget
   wioView:         'today',  // 'today' | 'week'
+  // Reports
+  reportYear:      null,
 };
 
 // ─── Modal / ephemeral state ──────────────────────────────────────────────────
@@ -239,6 +241,7 @@ function renderSidebar() {
     items.push({ id: 'requests', label: 'Requests',     icon: iInbox(), badge: pending || null });
     items.push({ id: 'staff',    label: 'Manage Staff', icon: iUsers() });
     if (u.role === 'admin') {
+      items.push({ id: 'reports', label: 'Reports', icon: iChart() });
       items.push({ action: 'openAnnouncementModal()', label: 'Post Announcement', icon: '<span style="font-size:15px;line-height:1">📢</span>' });
     }
   }
@@ -287,6 +290,7 @@ async function navigate(view) {
       case 'team':         await viewTeam(); break;
       case 'requests':     await viewRequests(); break;
       case 'staff':        await viewStaff(); break;
+      case 'reports':      await viewReports(); break;
       case 'user-profile': await viewUserProfile(); break;
       default:             await viewDashboard();
     }
@@ -430,6 +434,8 @@ async function viewDashboard() {
             </div>
           </div>
         </div>` : ''}
+
+        ${u.role === 'manager' ? `<div class="section">${buildDelegationCard(u.delegation || null)}</div>` : ''}
       </div>
 
       <div class="dashboard-col">
@@ -2139,6 +2145,259 @@ function handleOverlayClick(e) {
   if (e.target === document.getElementById('modal-overlay')) closeModal();
 }
 
+// ─── View: Reports ────────────────────────────────────────────────────────────
+
+async function viewReports() {
+  if (S.user?.role !== 'admin') return navigate('dashboard');
+  const main = document.getElementById('main-content');
+  main.innerHTML = `<div class="loading-view"><div class="spinner dark"></div></div>`;
+  if (!S.reportYear) S.reportYear = new Date().getFullYear();
+  await drawReports();
+}
+
+async function drawReports() {
+  const main = document.getElementById('main-content');
+  const year = S.reportYear;
+  const [summary, monthly] = await Promise.all([
+    api('GET', `/reports/summary?year=${year}`),
+    api('GET', `/reports/monthly?year=${year}`),
+  ]);
+
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  // Build monthly totals per month (sum across types)
+  const monthlyTotals = Array(12).fill(0);
+  (monthly.data || []).forEach(r => { monthlyTotals[r.month - 1] += r.days; });
+  const maxMonthly = Math.max(...monthlyTotals, 1);
+
+  // Year selector options (current year ±2)
+  const currentYear = new Date().getFullYear();
+  const yearOptions = [currentYear - 2, currentYear - 1, currentYear, currentYear + 1]
+    .map(y => `<option value="${y}" ${y === year ? 'selected' : ''}>${y}</option>`).join('');
+
+  const employees = (summary.users || []).filter(u => u.role !== 'admin');
+  const totalEmployees = employees.length;
+  const totalUsed      = employees.reduce((s, u) => s + u.used_days, 0);
+  const totalAllowance = employees.reduce((s, u) => s + u.total_days, 0);
+  const avgPct         = totalAllowance > 0 ? Math.round(totalUsed / totalAllowance * 100) : 0;
+
+  main.innerHTML = `
+    <div class="view-header">
+      <div>
+        <h1 class="view-title">Reports</h1>
+        <p class="view-subtitle">Leave utilisation across the company</p>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select class="select" style="width:auto" onchange="S.reportYear=parseInt(this.value);drawReports()">
+          ${yearOptions}
+        </select>
+        <button class="btn btn-ghost" onclick="exportReportCsv()">↓ Export CSV</button>
+      </div>
+    </div>
+
+    <div class="stats-grid" style="margin-bottom:24px">
+      <div class="stat-card blue">
+        <div class="stat-label">Employees</div>
+        <div class="stat-value">${totalEmployees}</div>
+        <div class="stat-sub">tracked members</div>
+      </div>
+      <div class="stat-card red">
+        <div class="stat-label">Days Taken</div>
+        <div class="stat-value">${totalUsed}</div>
+        <div class="stat-sub">in ${year}</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-label">Avg Utilisation</div>
+        <div class="stat-value">${avgPct}%</div>
+        <div class="stat-sub">of total allowance</div>
+      </div>
+      <div class="stat-card amber">
+        <div class="stat-label">Total Allowance</div>
+        <div class="stat-value">${totalAllowance}</div>
+        <div class="stat-sub">days budgeted</div>
+      </div>
+    </div>
+
+    <div class="report-grid">
+      <div class="section">
+        <div class="section-header"><h2 class="section-title">Monthly Breakdown</h2></div>
+        <div class="card"><div class="card-body">
+          <div class="bar-chart-v">
+            ${MONTH_NAMES.map((m, i) => {
+              const val = monthlyTotals[i];
+              const pct = Math.round(val / maxMonthly * 100);
+              return `<div class="bar-v-col">
+                <div class="bar-v-wrap"><div class="bar-v-fill" style="height:${pct}%" title="${val} days"></div></div>
+                <div class="bar-v-label">${m}</div>
+                <div class="bar-v-val">${val > 0 ? val : ''}</div>
+              </div>`;
+            }).join('')}
+          </div>
+        </div></div>
+      </div>
+
+      <div class="section">
+        <div class="section-header"><h2 class="section-title">Team Utilisation</h2></div>
+        <div class="card"><div class="card-body report-team-list">
+          ${(summary.teams || []).length === 0
+            ? `<p style="color:var(--text-3);font-size:13px">No teams configured yet.</p>`
+            : (summary.teams || []).map(t => `
+              <div class="bar-h-row">
+                <div class="bar-h-label" title="${escHtml(t.team)}">${escHtml(t.team)}</div>
+                <div class="bar-h-track">
+                  <div class="bar-h-fill" style="width:${t.pct}%"></div>
+                </div>
+                <div class="bar-h-stat">${t.pct}% <span style="color:var(--text-3)">(${t.totalUsed}/${t.totalAllowance} days)</span></div>
+              </div>`).join('')}
+        </div></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <h2 class="section-title">Employee Detail</h2>
+        <span style="font-size:12px;color:var(--text-3)">${totalEmployees} employees</span>
+      </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr>
+              <th>Name</th><th>Team(s)</th><th>Allowance</th><th>Used</th><th>Remaining</th><th>Utilisation</th>
+            </tr></thead>
+            <tbody>
+              ${employees.map(u => {
+                const pct = u.total_days > 0 ? Math.round(u.used_days / u.total_days * 100) : 0;
+                const barColor = pct >= 90 ? 'var(--red)' : pct >= 70 ? '#F59E0B' : '#16A34A';
+                return `<tr>
+                  <td style="font-weight:500">${escHtml(u.name)}</td>
+                  <td style="color:var(--text-2);font-size:12.5px">${u.teams.join(', ') || '—'}</td>
+                  <td style="text-align:center">${u.total_days}</td>
+                  <td style="text-align:center;font-weight:600">${u.used_days}</td>
+                  <td style="text-align:center">${u.remaining}</td>
+                  <td style="min-width:120px">
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <div style="flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+                        <div style="height:100%;width:${pct}%;background:${barColor};border-radius:3px"></div>
+                      </div>
+                      <span style="font-size:12px;font-weight:600;min-width:30px;color:${barColor}">${pct}%</span>
+                    </div>
+                  </td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function exportReportCsv() {
+  try {
+    const year = S.reportYear || new Date().getFullYear();
+    const res = await fetch(`/api/reports/export/csv?year=${year}`, {
+      headers: { Authorization: `Bearer ${S.token}` },
+    });
+    if (!res.ok) throw new Error('Export failed');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `holiday-report-${year}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+// ─── Delegation ───────────────────────────────────────────────────────────────
+
+function buildDelegationCard(delegation) {
+  const active = !!delegation;
+  const statusText = active
+    ? `Delegating to <strong>${escHtml(delegation.delegate_to_name)}</strong>${delegation.delegate_until ? ` until ${fmtDateShort(delegation.delegate_until)}` : ' (no expiry)'}`
+    : 'Your approval authority is active — you handle requests directly.';
+
+  return `
+    <div class="card delegate-card">
+      <div class="card-header">
+        <span class="card-title">Approval Delegation</span>
+        <span class="badge ${active ? 'badge-approved' : 'badge-pending'}" style="font-size:11px">
+          <span class="badge-dot"></span>${active ? 'Delegating' : 'Active'}
+        </span>
+      </div>
+      <div class="card-body" style="padding-top:8px">
+        <p style="font-size:13px;color:var(--text-2);margin:0 0 12px">${statusText}</p>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost btn-sm" onclick="openDelegateModal()">${active ? 'Change' : 'Set Up Delegation'}</button>
+          ${active ? `<button class="btn btn-danger btn-sm" onclick="clearDelegation()">Clear</button>` : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function openDelegateModal() {
+  api('GET', '/users').then(users => {
+    const managers = users.filter(u => (u.role === 'manager' || u.role === 'admin') && u.id !== S.user.id);
+    const current  = S.user.delegation;
+    showModal(`
+      <div class="modal-header">
+        <span class="modal-title">Set Up Delegation</span>
+        <button class="modal-close" onclick="closeModal()">${iX()}</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-stack">
+          <p style="font-size:13px;color:var(--text-2);margin:0">
+            While delegating, the chosen person can approve or reject requests on your behalf.
+          </p>
+          <div class="field">
+            <label class="field-label">Delegate approvals to</label>
+            <select class="select" id="del-target">
+              <option value="">— Select a manager or admin —</option>
+              ${managers.map(m => `<option value="${m.id}" ${current?.delegate_to === m.id ? 'selected' : ''}>${escHtml(m.name)} (${m.role})</option>`).join('')}
+            </select>
+          </div>
+          <div class="field">
+            <label class="field-label">Expires on <span style="color:var(--text-3);font-weight:400">(optional — leave blank for no expiry)</span></label>
+            <input type="date" class="input" id="del-until" value="${current?.delegate_until || ''}" min="${todayStr()}" />
+          </div>
+          <div id="del-err" class="modal-error hidden"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveDelegation()">Save Delegation</button>
+      </div>
+    `);
+  }).catch(err => toast(err.message, 'error'));
+}
+
+async function saveDelegation() {
+  const targetId = parseInt(document.getElementById('del-target')?.value);
+  const until    = document.getElementById('del-until')?.value || null;
+  const errEl    = document.getElementById('del-err');
+  if (!targetId) { errEl.textContent = 'Please select a person to delegate to.'; errEl.classList.remove('hidden'); return; }
+  errEl.classList.add('hidden');
+  try {
+    const { delegation } = await api('PATCH', '/users/me/delegate', { delegate_to: targetId, delegate_until: until });
+    S.user.delegation = delegation;
+    closeModal();
+    toast('Delegation saved');
+    navigate('dashboard');
+  } catch (err) { errEl.textContent = err.message; errEl.classList.remove('hidden'); }
+}
+
+async function clearDelegation() {
+  if (!confirm('Clear delegation? You will resume handling approvals directly.')) return;
+  try {
+    await api('PATCH', '/users/me/delegate', { delegate_to: null });
+    S.user.delegation = null;
+    toast('Delegation cleared');
+    navigate('dashboard');
+  } catch (err) { toast(err.message, 'error'); }
+}
+
 // ─── Icon SVGs ────────────────────────────────────────────────────────────────
 
 function svg(d, s = 16) {
@@ -2158,6 +2417,7 @@ function iPlus(s=14)   { return svg('<line x1="12" y1="5" x2="12" y2="19"/><line
 function iX()          { return svg('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>', 14); }
 function iArrowLeft()  { return svg('<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>', 14); }
 function iPerson()     { return svg('<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>', 14); }
+function iChart()      { return svg('<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>'); }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
