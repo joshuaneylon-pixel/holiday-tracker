@@ -358,6 +358,7 @@ input, select, textarea { font-family: var(--font); }
 .stat-card.green { --stat-accent: #16A34A; }
 .stat-card.amber { --stat-accent: #F59E0B; }
 .stat-card.blue  { --stat-accent: var(--blue); }
+.stat-card.teal  { --stat-accent: #0D9488; }
 
 .stat-label {
   font-size: 11px;
@@ -1242,6 +1243,51 @@ tbody tr:hover td { background: #FAFAF9; }
 }
 .toggle-input:checked + .toggle-track { background: var(--red); }
 .toggle-input:checked + .toggle-track::after { transform: translateX(16px); }
+
+/* ─── Who's Off: toggles & week view ────────────────────────────────────── */
+.wio-toggles {
+  display: flex;
+  gap: 0;
+  padding: 8px 16px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.wio-toggle-btn {
+  flex: 1;
+  padding: 5px 0;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.wio-toggle-btn:first-child { border-radius: 6px 0 0 6px; }
+.wio-toggle-btn:last-child  { border-radius: 0 6px 6px 0; border-left: none; }
+.wio-toggle-btn.active {
+  background: var(--red);
+  border-color: var(--red);
+  color: #fff;
+}
+.wio-day-group {
+  padding: 8px 0 4px;
+  border-bottom: 1px solid var(--border);
+}
+.wio-day-group:last-child { border-bottom: none; }
+.wio-day-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 16px 6px;
+}
+
+/* ─── Rejection reason inline ────────────────────────────────────────────── */
+.rejection-reason {
+  color: var(--red);
+  font-style: italic;
+}
 
 /* ─── Print ───────────────────────────────────────────────────────────────── */
 @media print {
